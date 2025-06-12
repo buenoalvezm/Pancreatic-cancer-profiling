@@ -1,0 +1,879 @@
+---
+title: "01_cohort_overview"
+output: html_document
+date: "2024-10-31"
+editor_options: 
+  chunk_output_type: console
+---
+
+
+## UKB data
+
+```{r ukb data}
+ukb_healthy_data <- read_table("data/ukb/UKBB_healthy_Olink.txt")
+ukb_healthy_metadata <-  read_table("data/UKB/UKBB_healthy_metatable.txt")
+ukb_pancreatic_data <- read_table("data/ukb/pancreas_cancer_olink.txt")
+ukb_pancreatic_metadata <- read_table("data/ukb/pancreas_cancer_meta.txt")
+
+# Formatting
+ukb_meta <- 
+  ukb_healthy_metadata |> 
+  select(id = eid, Sex, Age = Age_sample_collect) |> 
+  mutate(Disease = "Healthy") |> 
+  bind_rows(ukb_pancreatic_metadata |> 
+              select(id = eid, Sex, Age = Age_sample_collect, cancer_diagnosis = Cancer_age_diagnosis) |> 
+              mutate(Disease = "Pancreatic cancer") )
+
+ukb_data <- 
+  ukb_healthy_data |> 
+  separate(meaning, c("Assay", "Description"), sep = ";") |> 
+  select(id = eid, Assay, NPX = result) |> 
+  mutate(Disease = "Healthy") |> 
+  bind_rows(ukb_pancreatic_data |> 
+              separate(meaning, c("Assay", "Description"), sep = ";") |> 
+              select(id = eid, Assay, NPX = result) |> 
+              mutate(Disease = "Pancreatic cancer"))
+
+# Check duplicated healthy samples
+dublicated_healthy_ids <-
+  ukb_data |> 
+  group_by(id, Assay) |> 
+  summarise(n = n()) |> 
+  filter(n>1) |> 
+  distinct(id)
+
+ukb_meta <- 
+  ukb_meta |> 
+  filter(!id %in% dublicated_healthy_ids$id) 
+
+ukb_data <- 
+  ukb_data |> 
+  filter(!id %in% dublicated_healthy_ids$id) 
+
+ukb_meta_ext <- 
+  ukb_meta |> 
+  distinct(id, .keep_all = T) |> 
+  mutate(Difference = cancer_diagnosis - Age,
+         Group = case_when(Difference > 7 ~ "> 7 years before",
+                           Difference < 7 & Difference >= 5 ~ "5-7 years before",
+                           Difference < 5 & Difference >= 3 ~ "3-5 years before",
+                           Difference < 3 & Difference >= 1 ~ "1-3 years before",
+                           Difference < 1 & Difference >= -1 ~ "1 year before/after",
+                           Difference < -1 ~ "> 1 year after",
+                           Disease == "Healthy" ~ "Healthy"),
+         Group = factor(Group, levels = names(pal_ukb))) 
+```
+
+
+
+## CPTAC data 
+
+```{r}
+cptac_meta <- read_tsv("data/cptac/pdac_clinical_dataframe.tsv")
+cptac_data <- read_tsv("data/cptac/pdac_proteomics_dataframe.tsv")
+
+# Prepare data
+#proteins <- sub("\\.{3}\\d+$", "", colnames(cptac_data))[-1]
+
+#cptac <- cptac_data[3:nrow(cptac_data),] 
+
+#colnames(cptac) <-  c("Sample", proteins)
+
+# Paired data
+paired_samples <- 
+  cptac_meta |> 
+  filter(type_of_analyzed_samples...4 == "Tumor_and_Normal")
+  
+
+cptac_data_paired <- 
+  cptac_data[3:nrow(cptac_data),]  |> 
+  rename(Sample = Name) |> 
+  mutate(Type = ifelse(str_detect(Sample, "\\.N$"), "Normal", "Tumor"),
+         Patient = gsub("\\.N$", "", Sample)) |> 
+  filter(Patient %in% paired_samples$Patient_ID)
+
+```     
+
+# Age & sex distribution
+## UKB
+
+```{r}
+p_top <- 
+  ukb_meta |> 
+  ggplot(aes(y = Disease, x = Age, color = Disease, fill = Disease)) + 
+  geom_density_ridges(alpha = 0.7,
+                      scale = 0.9,
+                      #show.legend = F,
+                      size = 0.5,
+                      color = "black",
+                      quantile_lines=TRUE,
+                      quantile_fun=function(x,...)mean(x)) +
+  theme_hpa() +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = c("#8DC3AF", "#01395E")) +
+  xlab("Age") +
+  ylab("")  
+
+p_bottom <- 
+  ukb_meta |> 
+  mutate(Sex = case_when(Sex == 0 ~ "Female",
+                         Sex == 1 ~ "Male")) |> 
+  group_by(Disease, Sex) |> 
+  summarise(n = n_distinct(id))  |>  
+  arrange(Disease, desc(Sex)) |> 
+  mutate(cum_n = cumsum(n)) |> 
+  ungroup() |> 
+  arrange(Disease) |> 
+  ggplot(aes(Disease, n, fill = Sex, group = Sex)) +
+    geom_bar(stat = "identity", width = 0.4, alpha = 0.7,color = "black") +
+  coord_flip() +
+  geom_text(aes(label = n, y = cum_n - 8), size = 4) +
+  theme_hpa() +
+  theme(axis.line.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_blank(),
+        legend.position = "top") +
+  ylab("Number of samples") 
+
+(p_top | p_bottom)
+
+ggsave(savepath("cohorts_ukb.png"),
+       height = 4,
+       width = 7)
+```
+
+
+## CPTAC
+
+```{r}
+
+```
+
+
+
+
+# PCA/UMAP
+
+## UKBB-PPP
+
+```{r}
+
+pca_data <- 
+  cancer_data_wide |> 
+  filter(Disease %in% c("PAN", "CAD healthy")) |> 
+  select(-Disease) |> 
+  impute_values(ID = "DAid", wide_data = T) |> 
+  column_to_rownames("DAid") |> 
+  scale() |> 
+  t() |> 
+  do_pca()
+
+scores <- 
+  pca_data@scores |> 
+  as.data.frame() |> 
+  rownames_to_column("DAid") |> 
+  left_join(da_meta |> 
+              filter(Disease %in% c("Pancreatic cancer", "CAD healthy")), 
+            by = "DAid") |> 
+  mutate(Disease = ifelse(Disease == "CAD healthy", "Healthy", Disease)) |> 
+  ggplot(aes(PC1, PC2, color = Disease)) +
+  geom_point(alpha = 0.7) +
+  stat_ellipse(geom = "polygon", alpha = 0.3, aes(fill = Disease), color = NA) +
+  scale_color_manual(values = pal_group) +
+  scale_fill_manual(values = pal_group) +
+  theme_hpa() +
+  theme(legend.position = "top")
+
+```
+
+
+## CPTAC
+
+```{r}
+
+pca_data <- 
+  cancer_data_wide |> 
+  filter(Disease %in% c("PAN", "CAD healthy")) |> 
+  select(-Disease) |> 
+  impute_values(ID = "DAid", wide_data = T) |> 
+  column_to_rownames("DAid") |> 
+  scale() |> 
+  t() |> 
+  do_pca()
+
+scores <- 
+  pca_data@scores |> 
+  as.data.frame() |> 
+  rownames_to_column("DAid") |> 
+  left_join(da_meta |> 
+              filter(Disease %in% c("Pancreatic cancer", "CAD healthy")), 
+            by = "DAid") |> 
+  mutate(Disease = ifelse(Disease == "CAD healthy", "Healthy", Disease)) |> 
+  ggplot(aes(PC1, PC2, color = Disease)) +
+  geom_point(alpha = 0.7) +
+  stat_ellipse(geom = "polygon", alpha = 0.3, aes(fill = Disease), color = NA) +
+  scale_color_manual(values = pal_group) +
+  scale_fill_manual(values = pal_group) +
+  theme_hpa() +
+  theme(legend.position = "top")
+
+```
+
+
+## UMAP/PCA based on fewer proteins
+
+```{r}
+
+# DA
+pca_data <- 
+  cancer_data_wide |> 
+  filter(Disease %in% c("PAN", "CAD healthy")) |> 
+  select(all_of(c("DAid", proteins))) |> 
+  impute_values(ID = "DAid", wide_data = T) |> 
+  column_to_rownames("DAid") |> 
+  scale() |> 
+  t() |> 
+  do_pca()
+
+scores <- 
+  pca_data@scores |> 
+  as.data.frame() |> 
+  rownames_to_column("DAid") |> 
+  left_join(da_meta |> 
+              filter(Disease %in% c("Pancreatic cancer", "CAD healthy")), 
+            by = "DAid") |> 
+  mutate(Disease = ifelse(Disease == "CAD healthy", "Healthy", Disease)) |> 
+  ggplot(aes(PC1, PC2, color = Disease)) +
+  geom_point(alpha = 0.7) +
+  stat_ellipse(geom = "polygon", alpha = 0.3, aes(fill = Disease), color = NA) +
+  scale_color_manual(values = pal_group) +
+  scale_fill_manual(values = pal_group) +
+  theme_hpa() +
+  theme(legend.position = "top")
+
+loadings <- 
+  pca_data@loadings |> 
+  as.data.frame() |> 
+  rownames_to_column("Protein") |> 
+  ggplot(aes(PC1, PC2)) +
+  geom_point() +
+  geom_text_repel(aes(label = Protein)) +
+  theme_hpa()
+
+scores + loadings
+ggsave(savepath("pca_pancreas_DA.pdf"))
+
+
+# UKB
+pca_data <- 
+  ukb_data |>
+  select(DAid = id, Assay, NPX) |> 
+  pivot_wider(names_from = Assay, values_from = NPX)  |> 
+  select(all_of(c("DAid", proteins))) |> 
+  # pivot_longer(-1, names_to = "Assay", values_to = "NPX") |>
+  # filter(is.na(NPX)) |>
+  # group_by(DAid) |>
+  # summarise(n = n_distinct(Assay)) |>
+  #arrange(-n)
+  #impute_values(ID = "DAid", wide_data = T) |> 
+  column_to_rownames("DAid") |> 
+  scale() |> 
+ # t() |> 
+  do_pca()
+
+scores <- 
+  pca_data@scores |> 
+  as.data.frame() |> 
+  rownames_to_column("DAid") |> 
+  left_join(ukb_meta_ext |> 
+              filter(Disease %in% c("Pancreatic cancer", "CAD healthy")), 
+            by = "DAid") |> 
+  mutate(Disease = ifelse(Disease == "CAD healthy", "Healthy", Disease)) |> 
+  ggplot(aes(PC1, PC2, color = Disease)) +
+  geom_point(alpha = 0.7) +
+  stat_ellipse(geom = "polygon", alpha = 0.3, aes(fill = Disease), color = NA) +
+  scale_color_manual(values = pal_group) +
+  scale_fill_manual(values = pal_group) +
+  theme_hpa() +
+  theme(legend.position = "top")
+
+loadings <- 
+  pca_data@loadings |> 
+  as.data.frame() |> 
+  rownames_to_column("Protein") |> 
+  ggplot(aes(PC1, PC2)) +
+  geom_point() +
+  geom_text_repel(aes(label = Protein)) +
+  theme_hpa()
+
+scores + loadings
+ggsave(savepath("pca_pancreas_DA.pdf"))
+
+
+
+# CPTAC
+pca_data <- 
+  cptac_data_paired |>
+  select(all_of(c("Sample", proteins[!proteins %in% c("AGRP", "IL6", "CCL7",
+                               "CXCL8", "IL4R", "CALCA",
+                               "KLK13", "TNFSF11")]))) |> 
+  mutate_at(c(2:12), as.numeric) |> 
+  # pivot_longer(-1, names_to = "Assay", values_to = "NPX") |>
+  # filter(is.na(NPX)) |>
+  # group_by(DAid) |>
+  # summarise(n = n_distinct(Assay)) |>
+  #arrange(-n)
+  impute_values(ID = "Sample", wide_data = T) |>
+  column_to_rownames("Sample") |> 
+  scale() |> 
+  t() |> 
+  do_pca()
+
+scores <- 
+  pca_data@scores |> 
+  as.data.frame() |> 
+  rownames_to_column("DAid") |> 
+  left_join(ukb_meta_ext |> 
+              filter(Disease %in% c("Pancreatic cancer", "CAD healthy")), 
+            by = "DAid") |> 
+  mutate(Disease = ifelse(Disease == "CAD healthy", "Healthy", Disease)) |> 
+  ggplot(aes(PC1, PC2, color = Disease)) +
+  geom_point(alpha = 0.7) +
+  stat_ellipse(geom = "polygon", alpha = 0.3, aes(fill = Disease), color = NA) +
+  scale_color_manual(values = pal_group) +
+  scale_fill_manual(values = pal_group) +
+  theme_hpa() +
+  theme(legend.position = "top")
+
+loadings <- 
+  pca_data@loadings |> 
+  as.data.frame() |> 
+  rownames_to_column("Protein") |> 
+  ggplot(aes(PC1, PC2)) +
+  geom_point() +
+  geom_text_repel(aes(label = Protein)) +
+  theme_hpa()
+
+scores + loadings
+ggsave(savepath("pca_pancreas_DA.pdf"))
+
+
+```
+
+
+
+
+# Proteins in all cohorts
+
+
+## Boxplot
+
+```{r}
+protein <- "CSF1"
+cancer_data_long |>
+  filter(Assay == protein, 
+         Disease %in% c("PAN", "CAD healthy")) |>
+  mutate(Disease = recode(Disease, 
+                          PAN = "Pancreatic cancer",
+                          `CAD healthy` = "Healthy")) |> 
+  select(Sample = DAid, Protein_expression = NPX, Disease) |>
+  mutate(Dataset = "Disease Atlas") |> 
+  bind_rows(cptac_data_paired |> 
+              select(Sample, Type, Protein_expression = protein) |>
+              mutate(Disease = recode(Type,
+                                      Tumor = "Pancreatic cancer",
+                                      Normal = "Healthy"),
+                     Protein_expression = as.numeric(Protein_expression),
+                     Dataset = "CPTAC") |> 
+              select(-Type)) |>
+  bind_rows(ukb_data |> 
+              filter(Assay == protein) |> 
+              left_join(ukb_meta_ext, by = "id") |> 
+              select(Sample = id, Protein_expression = NPX, Disease = Group) |> 
+              mutate(Dataset = "UKB",
+                     Sample = as.character(Sample))) |> 
+  mutate(Disease = factor(Disease, levels = c(names(pal_group), names(pal_ukb)) |> unique())) |> 
+  ggplot(aes(Disease,Protein_expression, color = Disease, fill = Disease)) +
+  geom_quasirandom(alpha = 0.8) +
+  geom_boxplot(alpha = 0.2, color = "black", outlier.colour = NA) +
+  facet_wrap(~Dataset, scales = "free") +
+  theme_hpa() +
+  scale_color_manual(values = c(pal_group, pal_ukb)) +
+  scale_fill_manual(values = c(pal_group, pal_ukb)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  xlab("") +
+  ggtitle(protein) 
+
+ggsave(savepath(paste(protein, "_boxplot_all_datasets.pdf")), h = 4, w = 8)
+
+CDCP1
+S100P
+# Outliers
+protein <- "S100P" 
+cancer_data_long |>
+  filter(Assay == protein, 
+         Disease %in% c("PAN", "CAD healthy")) |>
+  mutate(Disease = recode(Disease, 
+                          PAN = "Pancreatic cancer",
+                          `CAD healthy` = "Healthy")) |> 
+  select(Sample = DAid, Protein_expression = NPX, Disease) |>
+  mutate(Dataset = "Disease Atlas") |> 
+  bind_rows(cptac_data_paired |> 
+              select(Sample, Type, Protein_expression = protein) |>
+              mutate(Disease = recode(Type,
+                                      Tumor = "Pancreatic cancer",
+                                      Normal = "Healthy"),
+                     Protein_expression = as.numeric(Protein_expression),
+                     Dataset = "CPTAC") |> 
+              select(-Type)) |>
+  bind_rows(ukb_data |> 
+              filter(Assay == protein) |> 
+              left_join(ukb_meta_ext, by = "id") |> 
+              select(Sample = id, Protein_expression = NPX, Disease = Group) |> 
+              mutate(Dataset = "UKB",
+                     Sample = as.character(Sample))) |> 
+  mutate(Disease = factor(Disease, levels = c(names(pal_group), names(pal_ukb)) |> unique())) |> 
+  ggplot(aes(Disease,Protein_expression, color = Disease, fill = Disease)) +
+  geom_quasirandom(alpha = 0.8) +
+  geom_boxplot(alpha = 0.2, color = "black", outlier.colour = NA) +
+  facet_wrap(~Dataset, scales = "free") +
+  theme_hpa() +
+  scale_color_manual(values = c(pal_group, pal_ukb)) +
+  scale_fill_manual(values = c(pal_group, pal_ukb)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  geom_text_repel(aes(label = Sample)) +
+  xlab("") +
+  ggtitle(protein) 
+
+
+meta_pancreatic
+
+p <- proteins[!proteins %in% c("AGRP", "IL6", "CCL7",
+                               "CXCL8", "IL4R", "CALCA",
+                               "KLK13", "TNFSF11")]
+lapply(p, function(protein) {
+  
+  cancer_data_long |>
+  filter(Assay == protein, 
+         Disease %in% c("PAN", "CAD healthy")) |>
+  mutate(Disease = recode(Disease, 
+                          PAN = "Pancreatic cancer",
+                          `CAD healthy` = "Healthy")) |> 
+  select(Sample = DAid, Protein_expression = NPX, Disease) |>
+  mutate(Dataset = "Disease Atlas") |> 
+  bind_rows(cptac_data_paired |> 
+              select(Sample, Type, Protein_expression = protein) |>
+              mutate(Disease = recode(Type,
+                                      Tumor = "Pancreatic cancer",
+                                      Normal = "Healthy"),
+                     Protein_expression = as.numeric(Protein_expression),
+                     Dataset = "CPTAC") |> 
+              select(-Type)) |>
+  bind_rows(ukb_data |> 
+              filter(Assay == protein) |> 
+              left_join(ukb_meta_ext, by = "id") |> 
+              select(Sample = id, Protein_expression = NPX, Disease = Group) |> 
+              mutate(Dataset = "UKB",
+                     Sample = as.character(Sample))) |> 
+  mutate(Disease = factor(Disease, levels = c(names(pal_group), names(pal_ukb)) |> unique())) |> 
+  ggplot(aes(Disease,Protein_expression, color = Disease, fill = Disease)) +
+  geom_quasirandom(alpha = 0.8) +
+  geom_boxplot(alpha = 0.2, color = "black", outlier.colour = NA) +
+  facet_wrap(~Dataset, scales = "free") +
+  theme_hpa() +
+  scale_color_manual(values = c(pal_group, pal_ukb)) +
+  scale_fill_manual(values = c(pal_group, pal_ukb)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  xlab("") +
+  ggtitle(protein) 
+
+ggsave(savepath(paste("examples/", protein, "_boxplot_all_datasets.png")), h = 5, w = 8)
+  
+})
+
+```
+
+## Figure all
+
+### Barplots
+
+```{r}
+
+top <- 
+  cancer_data_long |>
+  filter(Disease %in% c("PAN", "CAD healthy")) |>
+  mutate(Disease = recode(Disease, 
+                          PAN = "Pancreatic cancer",
+                          `CAD healthy` = "Healthy")) |> 
+  select(Sample = DAid, Protein_expression = NPX, Disease) |>
+  mutate(Dataset = "Disease Atlas") |> 
+  bind_rows(cptac_data_paired |> 
+              select(Sample, Type) |>
+              mutate(Disease = recode(Type,
+                                      Tumor = "Pancreatic cancer",
+                                      Normal = "Healthy"),
+                     Dataset = "CPTAC") |> 
+              select(-Type)) |>
+  bind_rows(ukb_data |> 
+              left_join(ukb_meta_ext, by = "id") |> 
+              select(Sample = id, Protein_expression = NPX, Disease = Group) |> 
+              mutate(Dataset = "UKB",
+                     Sample = as.character(Sample))) |> 
+  distinct(Sample, Disease, Dataset) |> 
+  mutate(Disease = factor(Disease, levels = c("Healthy", names(pal_ukb), "Pancreatic cancer") |> unique())) |> 
+  filter(Disease != "> 1 year after") |> 
+  group_by(Dataset) |> 
+  count(Disease) |> 
+  ggplot(aes(Disease, n, fill = Disease)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = n, y =  n + 10)) +
+  ggforce::facet_row(vars(Dataset), scales = 'free', space = 'free') +
+  #facet_grid(~Dataset, scales = "free", space = "free_x") +
+  scale_fill_manual(values = c(pal_group, pal_ukb)) +
+  theme_hpa(angled = T) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.line.x = element_blank(),
+        axis.title.x = element_blank())
+
+
+top
+ggsave(savepath("barplot_datasets_freescale.pdf"), h = 3, w = 9)
+
+
+```
+
+### Overlap 
+
+```{r}
+proteins_da <- 
+  cancer_data_long |> 
+  distinct(Assay) |> 
+  pull()
+
+proteins_cptac <-  sub("\\.{3}\\d+$", "", colnames(cptac_data_paired))[-1] |> unique()
+
+y <- list("MS" = proteins_cptac, 
+          "Olink" = proteins_da)
+plot(euler(y, shape = "ellipse"), quantities = TRUE, fills = c("#CDCADA", "#E9C2A6")) |> as.ggplot()
+
+ggsave(savepath("overlap_da_cptac.pdf"), h = 3, w = 3)
+```
+
+### Boxplots
+
+```{r}
+
+plot_protein_datsets <- function(protein, y_axis, x_axis, title) {
+  
+  cancer_data_long |>
+  filter(Assay == protein, 
+         Disease %in% c("PAN", "CAD healthy")) |>
+  mutate(Disease = recode(Disease, 
+                          PAN = "Pancreatic cancer",
+                          `CAD healthy` = "Healthy")) |> 
+  select(Sample = DAid, Protein_expression = NPX, Disease) |>
+  mutate(Dataset = "Disease Atlas") |> 
+  bind_rows(cptac_data_paired |> 
+              select(Sample, Type, Protein_expression = protein) |>
+              mutate(Disease = recode(Type,
+                                      Tumor = "Pancreatic cancer",
+                                      Normal = "Healthy"),
+                     Protein_expression = as.numeric(Protein_expression),
+                     Dataset = "CPTAC") |> 
+              select(-Type)) |>
+  bind_rows(ukb_data |> 
+              filter(Assay == protein) |> 
+              left_join(ukb_meta_ext, by = "id") |> 
+              select(Sample = id, Protein_expression = NPX, Disease = Group) |> 
+              mutate(Dataset = "UKB",
+                     Sample = as.character(Sample))) |> 
+  mutate(Disease = factor(Disease, levels = c(names(pal_group), names(pal_ukb)) |> unique()),
+         Dataset = factor(Dataset, levels = c("Disease Atlas", "UKB", "CPTAC"))) |> 
+  ggplot(aes(Disease,Protein_expression, color = Disease, fill = Disease)) +
+  geom_quasirandom(alpha = 0.8) +
+  geom_boxplot(alpha = 0.2, color = "black", outlier.colour = NA) +
+  #facet_wrap(~ Dataset , scales='free', ) 
+  ggforce::facet_row(vars(Dataset), scales = 'free', space = 'free') +
+  #facet_rep_grid(~Dataset, scales = "free", space = "free_x", repeat.tick.labels=TRUE) +
+  #facet_grid(~Dataset, scales = "free", space = "free_x") +
+  theme_hpa(axis_x = x_axis,
+            axis_y = y_axis,
+            facet_title = title,
+            angled = T
+            ) +
+  scale_color_manual(values = c(pal_group, pal_ukb)) +
+  scale_fill_manual(values = c(pal_group, pal_ukb)) +
+  xlab("") +
+  ylab("")
+  
+}
+
+protein <- "CTSV"
+plot_protein_datsets(protein = protein, y_axis = T, x_axis = F, title = T)
+ggsave(savepath(paste0("Lindgaard/", protein, "_boxplot_all_datasets.png")), h = 2.5, w = 8)
+
+
+
+ääprotein <- "CD4"
+plot_protein_datsets(protein = protein, y_axis = T, x_axis = F, title = T)
+ggsave(savepath(paste(protein, "_boxplot_all_datasets.png")), h = 2.5, w = 8)
+
+ ########
+
+
+plot_protein_datsets(protein = "PTN", y_axis = T, x_axis = F, title = F) /
+  plot_protein_datsets(protein = "GDF15", y_axis = T, x_axis = F, title = F) /
+  plot_protein_datsets(protein = "MDK", y_axis = T, x_axis = F, title = F)
+
+plot_protein_datsets(protein = "S100A12", y_axis = T, x_axis = F, title = F) /
+  plot_protein_datsets(protein = "S100P", y_axis = T, x_axis = F, title = F) 
+
+ggsave(savepath("examples_S100.pdf"))
+
+ggsave(savepath("examples_fig5.pdf"), h = 6, w = 10)
+
+protein <- "VAMP5"
+cancer_data_long |>
+  filter(Assay == protein, 
+         Disease %in% c("PAN", "CAD healthy")) |>
+  mutate(Disease = recode(Disease, 
+                          PAN = "Pancreatic cancer",
+                          `CAD healthy` = "Healthy")) |> 
+  select(Sample = DAid, Protein_expression = NPX, Disease) |>
+  mutate(Dataset = "Disease Atlas") |> 
+  bind_rows(cptac_data_paired |> 
+              select(Sample, Type, Protein_expression = protein) |>
+              mutate(Disease = recode(Type,
+                                      Tumor = "Pancreatic cancer",
+                                      Normal = "Healthy"),
+                     Protein_expression = as.numeric(Protein_expression),
+                     Dataset = "CPTAC") |> 
+              select(-Type)) |>
+  bind_rows(ukb_data |> 
+              filter(Assay == protein) |> 
+              left_join(ukb_meta_ext, by = "id") |> 
+              select(Sample = id, Protein_expression = NPX, Disease = Group) |> 
+              mutate(Dataset = "UKB",
+                     Sample = as.character(Sample))) |> 
+  mutate(Disease = factor(Disease, levels = c(names(pal_group), names(pal_ukb)) |> unique())) |> 
+  ggplot(aes(Disease,Protein_expression, color = Disease, fill = Disease)) +
+  geom_quasirandom(alpha = 0.8) +
+  geom_boxplot(alpha = 0.2, color = "black", outlier.colour = NA) +
+  #facet_wrap(~ Dataset , scales='free', ) 
+  ggforce::facet_row(vars(Dataset), scales = 'free', space = 'free') +
+  #facet_rep_grid(~Dataset, scales = "free", space = "free_x", repeat.tick.labels=TRUE) +
+  #facet_grid(~Dataset, scales = "free", space = "free_x") +
+  theme_hpa() +
+  scale_color_manual(values = c(pal_group, pal_ukb)) +
+  scale_fill_manual(values = c(pal_group, pal_ukb)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  xlab("") +
+  ggtitle(protein) 
+
+ggsave(savepath(paste(protein, "_boxplot_all_datasets.pdf")), h = 5, w = 9)
+
+protein <- "CCN1"
+ukb_data |> 
+  filter(Assay == protein) |> 
+  left_join(ukb_meta_ext, by = "id") |> 
+  select(Sample = id, Protein_expression = NPX, Sex, Disease = Group, Difference) |> 
+  mutate(Dataset = "UKB",
+         Sample = as.character(Sample)) |> 
+  filter(!is.na(Difference)) |> 
+  ggplot(aes(Difference, Protein_expression, color = as.character(Sex))) +
+  geom_point() +
+  scale_x_reverse() +
+  theme_hpa()
+
+
+
+  library(lemon)
+#####
+proteins <- c("HGF", "GPA33")
+
+cancer_data_long |>
+  filter(Assay %in% proteins, 
+         Disease %in% c("PAN", "CAD healthy")) |>
+  mutate(Disease = recode(Disease, 
+                          PAN = "Pancreatic cancer",
+                          `CAD healthy` = "Healthy")) |>
+  select(Sample = DAid, Protein = Assay, Protein_expression = NPX, Disease) |>
+  mutate(Dataset = "Disease Atlas") |> 
+  bind_rows(cptac_data_paired |> 
+              select(all_of(c("Sample", "Type", proteins))) |>
+              pivot_longer(!c(1:2), 
+                           names_to = "Protein",
+                           values_to = "Protein_expression") |> 
+              mutate(Disease = recode(Type,
+                                      Tumor = "Pancreatic cancer",
+                                      Normal = "Healthy"),
+                     Protein_expression = as.numeric(Protein_expression),
+                     Dataset = "CPTAC") |> 
+              select(-Type)) |>
+  bind_rows(ukb_data |> 
+              filter(Assay %in% proteins) |> 
+              left_join(ukb_meta_ext, by = "id") |> 
+              select(Sample = id, Protein = Assay, Protein_expression = NPX, Disease = Group) |> 
+              mutate(Dataset = "UKB",
+                     Sample = as.character(Sample))) |> 
+  mutate(Disease = factor(Disease, levels = c(names(pal_group), names(pal_ukb)) |> unique())) |> 
+  ggplot(aes(Disease,Protein_expression, color = Disease, fill = Disease)) +
+  geom_quasirandom(alpha = 0.8) +
+  geom_boxplot(alpha = 0.2, color = "black", outlier.colour = NA) +
+  #  facet_grid(cols = vars(group), scales = "free_x") +
+ggforce::facet_row(vars(Protein~Dataset), scales = 'free', space = 'free') +
+  #facet_grid(Protein~Dataset,  scales = "free_x", space = "free_x") +
+  theme_hpa() +
+  scale_color_manual(values = c(pal_group, pal_ukb)) +
+  scale_fill_manual(values = c(pal_group, pal_ukb)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  xlab("")
+
+```
+
+
+## Heatmap 
+
+```{r}
+model_targets <- c("FGF21", "C2", "CD109", "IL1RL1", "BST2", "CSF1", "GDF15", "MDK", "PTN", "VSIG4", "TFRC", "CALCA", "CEACAM5", "DLK1")
+
+final_targets <- model_targets[model_targets %in% colnames(cptac)] 
+
+all_data_scaled <- 
+  ukb_data |> 
+  rename(DAid = id) |> 
+  filter(Assay %in% final_targets) |> 
+  left_join(ukb_meta_ext |> 
+              select(DAid = id, Sex, Age, Difference), by = "DAid") |> 
+  group_by(Assay) |> 
+  mutate(Expression = scales::rescale(NPX, to = c(0,1))) |> 
+  select(-NPX) |> 
+  mutate(DAid = as.character(DAid),
+         Sex = recode(Sex,
+                      `1` = "Male",
+                      `0` = "Female")) |> 
+  
+  mutate(Dataset = "UKB") |> 
+  bind_rows(cancer_data_long |> 
+  select(DAid, Assay, NPX, Disease) |> 
+  filter(Disease %in% c("PAN", "CAD healthy"),
+         Assay %in% final_targets) |> 
+  mutate(Disease = recode(Disease, 
+                          `CAD healthy` = "Healthy",
+                          PAN = "Pancreatic cancer")) |> 
+  left_join(cancer_metadata |> 
+              select(DAid, Sex, Age), by = "DAid") |> 
+  group_by(Assay) |> 
+  mutate(Expression = scales::rescale(NPX, to = c(0,1)),
+         Dataset = "DA") |> 
+  select(-NPX)) |> 
+  bind_rows(cptac |> 
+  select(all_of(c("Sample", final_targets))) |> 
+  pivot_longer(-Sample, names_to = "Assay", values_to = "Expression") |> 
+  mutate(Expression = as.numeric(Expression)) |> 
+  rename(DAid = Sample) |> 
+  group_by(Assay) |> 
+  mutate(Expression = scales::rescale(Expression, to = c(0,1))) |> 
+  left_join(annotation |> 
+              left_join(meta |> 
+                          select(Patient = Patient_ID, Age = age, Sex = sex), by = "Patient") |> 
+              mutate(Disease = recode(Type,
+                                      Tumor = "Pancreatic cancer",
+                                      Normal = "Healthy")) |> 
+              select(DAid = Sample, Disease, Age, Sex), by = "DAid") |> 
+    mutate(Dataset = "CPTAC")) 
+
+
+all_annotation <- 
+  all_data_scaled |> 
+  ungroup() |> 
+  distinct(DAid, Dataset, Disease, Difference, Sex, Age) |> 
+  select(-Sex, -Age) |> 
+  column_to_rownames("DAid")
+
+my_palette <- colorRampPalette(c("#FFEB3B", "#FFECB3", "#FFEEC8", "#FFF0DC", "#FFF3F0"))(100)
+
+my_palette <- colorRampPalette(c("#FFF3F0", "#FFF0DC", "#FFECB3", "#DAA520", "#CC5500", "#B7410E", "#8B0000"))(100)
+my_palette <- colorRampPalette(c("#FFF3F0", "#FFF0DC", "#FFECB3", "#DAA520", "#CC5500", "#B7410E", "#8B0000"))(100)
+my_palette <- colorRampPalette(c("#FFF3F0", "#FFE6E2", "#FFD9D5", "#FFCCC8", "#FFBFB9", "#FFB2AC", "#FFA5A0"))(100)
+
+my_palette <- colorRampPalette(c("#FFFFE0", "#FFEBCC", "#FFD9A7", "#FFC266", "#E69F00", "#CC8400", "#A56900"))(100)
+my_palette <- colorRampPalette(c("#FFD9D5", "#FFC8C3", "#FFB7B1", "#FFA69F", "#FF968D", "#FF857C", "#FF746B"))(100)
+my_palette <- colorRampPalette(c("#FFFFE0", "#FFF1B1", "#FFD07F", "#FFAB4F", "#FF7F24", "#FF5400", "#FF2400"))(100)
+my_palette <- colorRampPalette(c("#FFEDC1", "#FFD58C", "#FFBF58", "#FFA328", "#FF8600", "#FF5A00", "#FF2400"))(100)
+
+my_palette <- colorRampPalette(c("#FFF3E0", "#FFE0B2", "#FFCC80", "#FFA726", "#FF9800", "#EF6C00", "#B7410E"))(100)
+
+my_palette <- colorRampPalette(c("#FFF3E0",  "#FFCC80", "#B7410E"))(100)
+
+
+all_data_scaled |> 
+  select(DAid, Assay, Expression) |> 
+  pivot_wider(names_from = "Assay", values_from = "Expression") |> 
+  impute_values(ID = "DAid", wide_data = T) |> 
+  column_to_rownames("DAid") |> 
+  pheatmap(color = my_palette,
+           clustering_method = "ward.D2",
+           annotation_row = all_annotation,
+           annotation_colors = list(#"Sex" = c("Male" = "#685195",
+                                     #         "Female" = "#C8885D"),
+                                    "Difference" = colorRampPalette(c("darkblue", "white"))(100),
+                                    #"Group" = pal,
+                                    "Disease" = c("Healthy" = "#8DC3AF",
+                                                  "Pancreatic cancer" = "#01395E"),
+                                    "Dataset" = c("DA" = "#D7F2BC",
+                                                  "CPTAC" = "#CDCADA", 
+                                                  "UKB" = "#D8A091")
+                                    ),
+           show_rownames = F) |> 
+  as.ggplot()
+
+
+ggsave(savepath)
+```
+
+
+## MEDECA comparison
+
+```{r}
+de_medeca <- read_tsv("data/de_medeca.tsv")
+
+joint_dat <- 
+  de_healthy |> 
+  select(Assay, logFC_DA = logFC, p_DA = adj.P.Val) |>
+  left_join(de_medeca |> 
+              filter(Cancer == "Pancreas or gall bladder or bile duct") |> 
+              select(Assay, logFC_MEDECA = logFC, p_MEDECA = adj.P.Val), by = "Assay") 
+
+top20_pval <- 
+  de_healthy |> 
+  top_n(30, -adj.P.Val)
+
+top20_fc <- 
+  de_healthy |> 
+  top_n(30, logFC)
+
+joint_dat |> 
+  mutate(top30_FC_DA = ifelse(Assay %in% top20_fc$Assay, "Yes", "No")) |> 
+  ggplot(aes(logFC_DA, logFC_MEDECA, color = top30_FC_DA)) +
+  geom_point() +
+  geom_text_repel(aes(label = Assay)) +
+  geom_hline(yintercept = 0, lty = "dashed", color = "grey") + 
+  geom_vline(xintercept = 0, lty = "dashed", color = "grey") +
+  scale_color_manual(values = c("grey", "darkred")) +
+  theme_hpa()  +
+  
+joint_dat |> 
+  mutate(top30_pval_DA = ifelse(Assay %in% top20_pval$Assay, "Yes", "No")) |> 
+  ggplot(aes(-log10(p_DA), -log10(p_MEDECA), color = top30_pval_DA)) +
+  geom_point() +
+  geom_text_repel(aes(label = Assay)) +
+  geom_hline(yintercept = -log10(0.05), lty = "dashed", color = "grey") + 
+  geom_vline(xintercept = -log10(0.05), lty = "dashed", color = "grey") +
+   scale_color_manual(values = c("grey", "darkred")) +
+  theme_hpa() 
+
+ggsave(savepath("pancreatic_MEDECA_comparison.png"), h = 5, w = 12)
+```

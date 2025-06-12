@@ -1,0 +1,722 @@
+---
+title: "02_differential_expression"
+output: html_document
+date: "2024-10-31"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Set up
+
+```{r}
+library(HDAnalyzeR)
+
+source("scripts/functions/functions_analyses.R")
+source("scripts/functions/functions_utility.R")
+source("scripts/functions/functions_visualization.R")
+source("scripts/functions/themes_palettes.R")
+
+
+# Read in data (pan-disease)
+data_disease <- import_df("../Human-disease-blood-atlas/data/final_data/HPA/v24_2/disease_data_phase1.tsv")
+meta_disease <- import_df("../Human-disease-blood-atlas/data/final_data/HPA/v24_2/disease_meta_phase1.tsv")
+
+# Pancreatic cancer metadata
+pancreatic_meta <- readxl::read_excel("data/clinical_metadata/Pancreatic/UPApatients.xlsx")
+```
+
+## Subsample DA data
+
+```{r Subsample other cancers}
+# Minimum is myeloma - 41 -> 40 from each disease
+cancer_metadata |> 
+  filter(!Disease %in% c("PAN", "CAD healthy")) |> 
+  group_by(Disease) |> 
+  summarise(n = n_distinct(DAid)) |> 
+  arrange(n)
+
+set.seed(213)
+sampled_other_cancers <- 
+  cancer_metadata |> 
+  filter(!Disease %in% c("PAN", "CAD healthy")) |> 
+  group_by(Disease) |> 
+  sample_n(40)
+
+final_meta <- 
+  sampled_other_cancers |> 
+  bind_rows(cancer_metadata |> 
+              filter(Disease %in% c("PAN", "CAD healthy"))) |> 
+  mutate(Disease = case_when(Disease == "PAN" ~ "Pancreatic cancer",
+                             Disease == "CAD healthy" ~ "Healthy",
+                             T ~ "Other cancers")) 
+```
+
+# Differential expression analyses
+
+## DE Phase 1
+
+```{r}
+de_results <- hd_de_limma(dat_p1, 
+                          variable = "Disease", 
+                          case = "Pancreatic cancer", 
+                          control = "Healthy", 
+                          correct = c("Age", "Sex")) #|> 
+
+de_results |> hd_plot_volcano()
+
+enrichment <- hd_gsea(de_results, 
+                      database = "GO", 
+                      ontology = "BP", 
+                      pval_lim = 0.9, 
+                      ranked_by = "both")
+
+enrichment_plots <- hd_plot_gsea(enrichment)
+enrichment_plots$cnetplot
+
+biomarkers <- list("acute myeloid leukemia" = c("FLT3", "EPO"),
+                   "chronic lymphocytic leukemia" = c("PARP1", "FCER2"))
+
+lit_res <- hd_literature_search(biomarkers, max_articles = 5)
+
+dat_p2$metadata |> 
+  distinct(Disease)
+
+de_results_p2 <- hd_de_limma(dat_p2, 
+                             variable = "Disease", 
+                             case = "Pancreatic ductal adenocarcinoma", 
+                            # control = "Healthy", 
+                             correct = c("Age", "Sex"))
+
+de_results_p2$de_res |> 
+  filter(Feature %in% de_results$de_res$Feature) |> 
+  plot_volcano()
+```
+
+
+## Compared to healthy
+
+```{r}
+# Prepare data & metadata
+patients_de <- 
+  final_meta |> 
+  filter(Disease %in% c("Pancreatic cancer", "Healthy")) |> # 941 -> 931 (not many exclusions)
+  filter(!is.na(Sex),
+         !Age < 10,
+         !is.na(Age))
+
+wide_data <- 
+  cancer_data_wide |> 
+  select(-Disease) |> 
+  filter(DAid %in% patients_de$DAid) 
+
+# Run differential expression analysis
+de_healthy <- 
+  de_limma_disease(data_wide = wide_data, 
+                   metadata = patients_de,
+                   disease = "Pancreatic cancer",
+                   correct = T) |> 
+  mutate(sig = case_when(adj.P.Val < 0.05 & logFC < -1 ~ "significant down",
+                         adj.P.Val < 0.05 & logFC > 1 ~ "significant up", 
+                         T ~ "not significant"))
+
+# Generate volcano plot
+volcano_healthy <- plot_volcano(de_healthy)
+ggsave(savepath("de_pancreatic_DA.png"), h = 5, w = 5)
+```
+
+
+## Compared to other cancers
+
+```{r}
+# Prepare data & metadata
+patients_de_cancers <- 
+  final_meta |> 
+  filter(Disease %in% c("Pancreatic cancer", "Other cancers")) |> # 594 -> 569 (not many exclusions)
+  filter(!is.na(Sex),
+         !Age < 10,
+         !is.na(Age)) 
+
+wide_data_cancers <- 
+  cancer_data_long |> 
+  filter(DAid %in% patients_de_cancers$DAid) |> 
+  select(DAid, Assay, NPX) |> 
+  pivot_wider(names_from = "Assay", values_from = "NPX") 
+
+# Run differential expression analysis
+de_cancers <- 
+  de_limma_disease(data_wide = wide_data_cancers, 
+                   metadata = patients_de_cancers,
+                   disease = "Pancreatic cancer",
+                   correct = T)  |> 
+  mutate(sig = case_when(adj.P.Val < 0.05 & logFC < -1 ~ "significant down",
+                         adj.P.Val < 0.05 & logFC > 1 ~ "significant up", 
+                         T ~ "not significant"))
+
+# Generate volcano plot
+volcano_cancers <- plot_volcano(de_cancers)
+```
+
+
+# Summary
+
+## Comparison
+
+```{r}
+# Combine results
+de_combined <- 
+  de_healthy |> 
+  select(Assay, logFC_healthy = logFC, adjpval_healthy = adj.P.Val, sig_healthy = sig) |> 
+  left_join(de_cancers |> 
+              select(Assay, logFC_cancers = logFC, adjpval_cancers = adj.P.Val, sig_cancers = sig), by = "Assay") |> 
+  mutate(Significance = ifelse(sig_healthy == sig_cancers, sig_healthy, "not significant")) 
+
+
+de_combined |> 
+  saveRDS("data/processed/DE/DE_combined.rds")
+# Compare log fold change
+comparison_fc <- 
+  de_combined |> 
+  ggplot(aes(logFC_healthy, logFC_cancers, label = Assay, color = Significance)) +
+  geom_point() +
+  geom_text_repel(show.legend = F, size = 3) +
+  scale_color_manual(values = pal_de) +
+  theme_hpa() 
+
+# Figure 2 A,C & C
+#volcano_healthy + volcano_cancers + comparison_fc
+#ggsave(savepath("volcanos.pdf"), h = 4, w = 12)
+```
+
+## Overlap 
+
+```{r}
+
+# Supplementary figure C
+
+```
+
+## Boxplots - top proteins 
+
+```{r}
+de_combined |> 
+  filter(Significance != "not significant") |> 
+  mutate(logFC_avg = (abs(logFC_cancers) + abs(logFC_healthy))/2) |> 
+  group_by(Significance) |> 
+  top_n(4, logFC_avg) |> 
+  arrange(Significance,-logFC_avg)
+
+top_up <- c("PTN", "MUC16", "FGF21", "CCL20")
+top_down <-  c("GPA33", "SSC4D", "TMPRSS15", "TNFSF11")
+
+long_levels <- 
+  cancers_mapping |> 
+  mutate(Cancer = ifelse(Cancer_code %in% c("AML", "CLL"), Cancer_code, Cancer),
+         Cancer = ifelse(Cancer_code %in% c("LYMPH"), "DLBCL", Cancer),
+         Cancer_code = factor(Cancer_code, levels = all_cancers_levels)) |> 
+  arrange(Cancer_code) |> 
+  pull(Cancer)
+
+upregulated_prots <- 
+  cancer_data_long |> 
+  filter(Assay %in% top_up,
+         Disease %in% all_levels) |> 
+  rename(GROUP = Disease) |> 
+  mutate(Disease = case_when(GROUP == "PAN" ~ "Pancreatic cancer",
+                             GROUP == "CAD healthy" ~ "Healthy",
+                             T ~ "Other cancers")) |> 
+  left_join(cancers_mapping |> 
+              mutate(Cancer = ifelse(Cancer_code %in% c("AML", "CLL"), Cancer_code, Cancer),
+                     Cancer = ifelse(Cancer_code %in% c("LYMPH"), "DLBCL", Cancer)), 
+            by = c("GROUP" = "Cancer_code")) |> 
+  mutate(Cancer = ifelse(GROUP == "CAD healthy", "Healthy", Cancer),
+         Assay = factor(Assay, levels = top_up),
+         Cancer = factor(Cancer, levels = c(long_levels, "Healthy"))) |> 
+  select(DAid, Cancer, Disease, Assay, NPX) |> 
+  ggplot(aes(Cancer, NPX, color = Disease)) +
+  geom_quasirandom(alpha = 0.4, show.legend = F) +
+  geom_boxplot(fill = NA, color = "grey60", outlier.color = NA) +
+  facet_wrap(~ Assay, ncol = 2, scales = "free_y") +  
+  scale_color_manual(values = pal_group) +
+  xlab("") +
+  theme_hpa()
+
+
+downregulated_prots <- 
+  cancer_data_long |> 
+  filter(Assay %in% top_down,
+         Disease %in% all_levels) |> 
+  rename(GROUP = Disease) |> 
+  mutate(Disease = case_when(GROUP == "PAN" ~ "Pancreatic cancer",
+                             GROUP == "CAD healthy" ~ "Healthy",
+                             T ~ "Other cancers")) |> 
+  left_join(cancers_mapping |> 
+              mutate(Cancer = ifelse(Cancer_code %in% c("AML", "CLL"), Cancer_code, Cancer),
+                     Cancer = ifelse(Cancer_code %in% c("LYMPH"), "DLBCL", Cancer)), 
+            by = c("GROUP" = "Cancer_code")) |> 
+  mutate(Cancer = ifelse(GROUP == "CAD healthy", "Healthy", Cancer),
+         Assay = factor(Assay, levels = top_down),
+         Cancer = factor(Cancer, levels = c(long_levels, "Healthy"))) |> 
+  select(DAid, Cancer, Disease, Assay, NPX) |> 
+  ggplot(aes(Cancer, NPX, color = Disease)) +
+  geom_quasirandom(alpha = 0.4, show.legend = F) +
+  geom_boxplot(fill = NA, color = "grey60", outlier.color = NA, show.legend = F,linewidth = 0.5) +
+  facet_wrap(~ Assay, ncol = 2, scales = "free_y") +  
+  scale_color_manual(values = pal_group) +
+  xlab("") +
+  theme_hpa()
+
+
+upregulated_prots <- 
+  cancer_data_long |> 
+  filter(Assay %in% c(top_up),
+         Disease %in% all_levels) |> 
+  rename(GROUP = Disease) |> 
+  mutate(Disease = case_when(GROUP == "PAN" ~ "Pancreatic cancer",
+                             GROUP == "CAD healthy" ~ "Healthy",
+                             T ~ "Other cancers")) |> 
+  left_join(cancers_mapping |> 
+              mutate(Cancer = ifelse(Cancer_code %in% c("AML", "CLL"), Cancer_code, Cancer),
+                     Cancer = ifelse(Cancer_code %in% c("LYMPH"), "DLBCL", Cancer)), 
+            by = c("GROUP" = "Cancer_code")) |> 
+  mutate(Cancer = ifelse(GROUP == "CAD healthy", "Healthy", Cancer),
+         Assay = factor(Assay, levels = c(top_up)),
+         Cancer = factor(Cancer, levels = c("Healthy", "Pancreatic cancer", long_levels[-14]))) |> 
+  select(DAid, Cancer, Disease, Assay, NPX) |> 
+  ggplot(aes(Cancer, NPX, color = Disease, fill = Disease)) +
+  geom_quasirandom(size = 0.8, alpha = 0.4, stroke = NA, show.legend = F) +
+  geom_boxplot(alpha = 0.4, color = "grey30", outlier.color = NA, show.legend = F, linewidth = 0.5) +
+  facet_wrap(~ Assay, nrow = 4, scales = "free_y") +  
+  scale_color_manual(values = pal_group) +
+  scale_fill_manual(values = pal_group) +
+  #coord_flip() +
+  xlab("") +
+  theme_hpa(angled = T)
+
+downregulated_prots <- 
+  cancer_data_long |> 
+  filter(Assay %in% c(top_down),
+         Disease %in% all_levels) |> 
+  rename(GROUP = Disease) |> 
+  mutate(Disease = case_when(GROUP == "PAN" ~ "Pancreatic cancer",
+                             GROUP == "CAD healthy" ~ "Healthy",
+                             T ~ "Other cancers")) |> 
+  left_join(cancers_mapping |> 
+              mutate(Cancer = ifelse(Cancer_code %in% c("AML", "CLL"), Cancer_code, Cancer),
+                     Cancer = ifelse(Cancer_code %in% c("LYMPH"), "DLBCL", Cancer)), 
+            by = c("GROUP" = "Cancer_code")) |> 
+  mutate(Cancer = ifelse(GROUP == "CAD healthy", "Healthy", Cancer),
+         Assay = factor(Assay, levels = c(top_down)),
+         Cancer = factor(Cancer, levels = c("Healthy", "Pancreatic cancer", long_levels[-14]))) |> 
+  select(DAid, Cancer, Disease, Assay, NPX) |> 
+  ggplot(aes(Cancer, NPX, color = Disease, fill = Disease)) +
+  geom_quasirandom(size = 0.8, alpha = 0.4, stroke = NA, show.legend = F) +
+  geom_boxplot(alpha = 0.4, color = "grey30", outlier.color = NA, show.legend = F, linewidth = 0.5) +
+  facet_wrap(~ Assay, nrow = 4, scales = "free_y") +  
+  scale_color_manual(values = pal_group) +
+  scale_fill_manual(values = pal_group) +
+  #coord_flip() +
+  xlab("") +
+  theme_hpa(angled = T)
+
+
+upregulated_prots + downregulated_prots
+
+ggsave(savepath("boxplots_de.pdf"), h = 7, w = 6)
+ggsave(savepath("boxplots_de.pdf"), h = 7, w = 8)
+
+# Alternative
+cancer_data_long |> 
+  filter(Assay %in% c(top_up, top_down),
+         Disease %in% all_levels) |> 
+  rename(GROUP = Disease) |> 
+  mutate(Disease = case_when(GROUP == "PAN" ~ "Pancreatic cancer",
+                             GROUP == "CAD healthy" ~ "Healthy",
+                             T ~ "Other cancers")) |> 
+  left_join(cancers_mapping |> 
+              mutate(Cancer = ifelse(Cancer_code %in% c("AML", "CLL"), Cancer_code, Cancer),
+                     Cancer = ifelse(Cancer_code %in% c("LYMPH"), "DLBCL", Cancer)), 
+            by = c("GROUP" = "Cancer_code")) |> 
+  mutate(Cancer = ifelse(GROUP == "CAD healthy", "Healthy", Cancer),
+         Assay = factor(Assay, levels = c(top_up, top_down)),
+         Cancer = factor(Cancer, levels = c(long_levels, "Healthy"))) |> 
+  select(DAid, Cancer, Disease, Assay, NPX) |> 
+  ggplot(aes(Cancer, NPX, color = Disease)) +
+  geom_quasirandom(alpha = 0.4, show.legend = F) +
+  geom_boxplot(fill = NA, color = "grey60", outlier.color = NA) +
+  facet_wrap(~ Assay, ncol = 8, scales = "free_x") +  
+  scale_color_manual(values = pal_group) +
+  coord_flip() +
+  xlab("") +
+  theme_hpa()
+
+ggsave(savepath("boxplots_de.pdf"), h = 4, w = 16)
+
+# Figure 2 D, E
+
+```
+
+## Heatmap - top proteins 
+
+
+```{r}
+significant_prots <-
+  de_combined |>
+  filter(Significance != "not significant") |>
+  arrange(Significance, logFC_cancers) |>
+  select(Assay, Significance) |>
+  left_join(hpa_info_short |> 
+              select(Assay = Gene, Secretome = `Secretome location`) |> 
+              mutate(Secretome = ifelse(is.na(Secretome), "Unknown", Secretome)), by = "Assay") |> 
+  column_to_rownames("Assay")
+
+heatmap_samples <- 
+  final_meta |> 
+  filter(Disease != "Other cancers") |> 
+  select(DAid, Disease) |> 
+  column_to_rownames("DAid")
+
+cancer_data_long |> 
+  filter(Assay %in% rownames(significant_prots),
+         DAid %in% rownames(heatmap_samples)) |> 
+  mutate(Assay = factor(Assay, levels = rownames(significant_prots)),
+         DAid = factor(DAid, levels = rownames(heatmap_samples))) |> 
+  filter(Disease %in% c("CAD healthy", "PAN")) |> 
+  select(DAid, Assay, NPX) |> 
+  group_by(Assay) |> 
+  mutate(NPX = scales::rescale(NPX, to = c(0,1))) |> 
+  arrange(DAid, Assay) |> 
+  pivot_wider(names_from = "Assay", values_from = "NPX") |> 
+  column_to_rownames("DAid") |> 
+  pheatmap(show_rownames = F,
+           clustering_method = "ward.D2",
+           # cluster_rows = F, 
+           #cluster_cols = F,
+           border_color = NA,
+           annotation_col =  significant_prots,
+           annotation_row = heatmap_samples,
+           annotation_colors = list(Disease = pal_group,
+                                    Significance = pal_de[-1])) |> 
+  as.ggplot()
+
+
+ggsave(savepath("heatmap_de.pdf"), h = 4, w = 14)
+
+library(RColorBrewer)
+rd_bu_continuous <- rev(colorRampPalette(brewer.pal(11, "RdBu"))(100))
+
+cancer_data_long |> 
+  filter(Assay %in% rownames(significant_prots),
+         DAid %in% rownames(heatmap_samples)) |> 
+  mutate(Assay = factor(Assay, levels = rownames(significant_prots)),
+         DAid = factor(DAid, levels = rownames(heatmap_samples))) |> 
+  filter(Disease %in% c("CAD healthy", "PAN")) |> 
+  select(DAid, Assay, NPX) |> 
+
+  pivot_wider(names_from = "Assay", values_from = "NPX") |> 
+  column_to_rownames("DAid") |> 
+  scale() |> 
+  pheatmap(show_rownames = F,
+           color = rd_bu_continuous,
+           clustering_method = "ward.D2",
+
+          border_color = NA,
+           annotation_col =  significant_prots,
+           annotation_row = heatmap_samples,
+           annotation_colors = list(Disease = pal_group,
+                                    Secretome = pal_secreted,
+                                    Significance = pal_de[-1])) |> 
+  as.ggplot()
+
+ggsave(savepath("healtmap_DE.pdf"), h = 6, w = 16)
+
+significant_prots |> 
+  rownames_to_column("Gene") |> 
+  left_join(hpa_info_short |> 
+              select(Gene, secretome = `Secretome location`))
+```
+
+## Correlation
+
+### All DE proteins
+
+```{r}
+de_prots <-
+  de_combined |>
+  filter(Significance != "not significant") |>
+  select(-sig_healthy, -sig_cancers) |>
+  mutate(log10pval_healthy = -log10(adjpval_healthy),
+         log10pval_cancers= -log10(adjpval_cancers)) |> 
+  select(Assay, logFC_healthy, logFC_cancers, log10pval_healthy, log10pval_cancers, Significance) |> 
+  column_to_rownames("Assay")
+
+corr_mat <- 
+  cancer_data_long |> 
+  filter(Assay %in% rownames(significant_prots),
+         DAid %in% rownames(heatmap_samples)) |> 
+  mutate(Assay = factor(Assay, levels = rownames(significant_prots)),
+         DAid = factor(DAid, levels = rownames(heatmap_samples))) |> 
+  filter(Disease %in% c("CAD healthy", "PAN")) |> 
+  select(DAid, Assay, NPX) |> 
+  pivot_wider(names_from = "Assay", values_from = "NPX") |> 
+  column_to_rownames("DAid") |> 
+  scale() |> 
+  cor(use = "complete.obs")
+
+colors <- 
+  de_prots |> 
+  group_by_all() |> 
+  mutate(color = pal_de[[Significance]]) |> 
+  ungroup() |> 
+  pull(color)
+
+ord <- corrMatOrder(corr_mat, order="hclust", hclust.method = "ward.D2")
+
+new_colours <- 
+  colnames(corr_mat)[ord] |> 
+  enframe() |> 
+  left_join(de_prots |> 
+              rownames_to_column("value"), by = "value") |> 
+  group_by_all() |> 
+  mutate(color = pal_de[[Significance]]) |> 
+  ungroup() |> 
+  select(value, color) |> 
+  deframe()
+
+corrplot(corr_mat, 
+         method = "square",
+         type="lower", 
+         order="hclust", 
+         hclust.method = "ward.D2",
+         col=pal_corr,  
+         tl.srt=0,
+         tl.col = new_colours) |> 
+  as.ggplot()
+
+# Supplememntary Figure 4A
+ggsave(savepath("corr_de.pdf"), h = 10, w = 10)
+
+corr_mat |> 
+  pheatmap(annotation_row = de_prots,
+           color = col(200),
+           annotation_colors = list(Significance = pal_de[-1]))
+```
+
+### High correlation examples
+
+```{r}
+corr_mat |> 
+  as_tibble(rownames = "Protein1") |> 
+  pivot_longer(cols = -Protein1,
+               names_to = "Protein2", 
+               values_to = "cor") |> 
+  filter(Protein1 != Protein2) |> 
+  arrange(-abs(cor))
+
+dat <- 
+  cancer_data_long |> 
+  filter(DAid %in% rownames(heatmap_samples)) |> 
+  mutate(DAid = factor(DAid, levels = rownames(heatmap_samples))) |> 
+  filter(Disease %in% c("CAD healthy", "PAN")) |> 
+  select(DAid, Disease,Assay, NPX) |> 
+  pivot_wider(names_from = "Assay", 
+              values_from = "NPX") 
+
+dat |> 
+  mutate(Disease = recode(Disease,
+                           `CAD healthy` = "Healthy",
+                           PAN = "Pancreatic cancer")) |> 
+  ggplot(aes(REG1B, REG1A, color = Disease)) +
+  geom_point() +
+  geom_text(aes(y = 5, x = 0, 
+                label = paste0("Pearson's r: ", round(cor(REG1B, REG1A),2))),
+            inherit.aes = F,
+            color = "black") +
+  scale_color_manual(values = pal_group) +
+  theme_hpa()
+
+# Supplementary Figure 4 C
+ggsave(savepath("cor_REG1A_REG1B.pdf"), h = 4, w = 6)
+
+dat |> 
+  mutate(Disease = recode(Disease,
+                           `CAD healthy` = "Healthy",
+                           PAN = "Pancreatic cancer")) |> 
+  ggplot(aes(EPCAM, GPA33, color = Disease)) +
+  geom_point() +
+   geom_text(aes(y = 3, x = -2, 
+                label = paste0("Pearson's r: ", round(cor(EPCAM, GPA33),2))),
+            inherit.aes = F,
+            color = "black") +
+  scale_color_manual(values = pal_group) +
+  theme_hpa()
+
+# Supplementary Figure 4 C
+ggsave(savepath("cor_EPCAM_GPA33.pdf"), h = 4, w = 6)
+
+
+# REG1B    REG1A 
+# EPCAM    GPA33
+# AGXT     HAO1    
+# PTN      SFRP1
+# CSF1     VSIG4
+# PTN       MDK 
+```
+
+### Correlation distribution
+
+```{r}
+corr_mat_all <- 
+  cancer_data_long |> 
+  filter(DAid %in% rownames(heatmap_samples)) |> 
+  filter(Disease %in% c("CAD healthy", "PAN")) |> 
+  select(DAid, Assay, NPX) |> 
+  pivot_wider(names_from = "Assay", values_from = "NPX") |> 
+  column_to_rownames("DAid") |> 
+  scale() |> 
+  cor(use = "complete.obs")
+ 
+df_corr_all <- 
+  corr_mat_all |> 
+  as_tibble(rownames = "Protein1") |> 
+  pivot_longer(cols = -Protein1,
+               names_to = "Protein2", 
+               values_to = "cor") |> 
+  filter(Protein1 != Protein2) |> 
+  left_join(de_combined |> 
+              mutate(Significance = ifelse(Significance == "not significant", "s1", Significance)) |> 
+              select(Protein1 = Assay, s1 = Significance), by = "Protein1") |> 
+  left_join(de_combined |> 
+              mutate(Significance = ifelse(Significance == "not significant", "s2", Significance)) |> 
+              select(Protein2 = Assay, s2 = Significance), by = "Protein2") |> 
+  mutate(type = ifelse(s1 == s2, "intra", "inter")) 
+
+mu <- 
+  df_corr_all |> 
+  group_by(type) |> 
+  summarise(cor = median(cor))
+
+df_corr_all |> 
+  ggplot(aes(cor, fill = type, color = type)) +
+  geom_density(alpha = 0.6, color = NA) +
+  geom_vline(data = mu, aes(xintercept = cor, color = type),
+             show.legend = F, linetype = "dashed") +
+  scale_color_manual(values = c("grey80", "grey20")) +
+  scale_fill_manual(values = c("grey80", "grey20")) +
+  theme_hpa()
+
+# Supplementary figure 4 B
+ggsave(savepath("cor_density.pdf"), h = 4, w = 7)
+```
+
+
+
+# Enrichment - GSEA
+
+```{r}
+original_gene_list <- de_combined$logFC_healthy
+names(original_gene_list) <- 
+  de_combined |> 
+  left_join(cancer_data_long |> 
+              distinct(Assay, UniProt), by = "Assay") |> 
+  pull(UniProt)
+
+gene_list = sort(original_gene_list, decreasing = TRUE)
+```
+
+
+## KEGG
+
+```{r}
+kegg_organism <-  "hsa"
+
+kk2 <- gseKEGG(geneList     = gene_list,
+               organism     = kegg_organism,
+               #nPerm        = 10000,
+               #minGSSize    = 3,
+               #maxGSSize    = 800,
+               pvalueCutoff = 0.05,
+               pAdjustMethod = "BH",
+               keyType       = "uniprot")
+
+# Dotplot
+dotplot(kk2, showCategory = 20, title = "Enriched Pathways" , split=".sign") + facet_grid(.~.sign) + theme_hpa()
+
+ggsave(savepath("gsea_kegg.pdf"), h = 6, w = 6)
+
+# Pathway network - Figure 2 F
+cnetplot(edox, categorySize="pvalue", color.params = list(foldChange = gene_list))
+ggsave(savepath("KEGG_GSEA.pdf"), h = 10, w = 10)
+```
+
+### Pathways
+
+```{r}
+dme <- pathview(gene.data = kegg_gene_list, 
+                pathway.id = "hsa05212", 
+                species = kegg_organism)
+```
+
+### IL-17 pathway proteins
+
+```{r}
+# cancer_data_long |> 
+#   distinct(Assay) |> 
+#   filter(grepl("DEF", Assay))
+
+proteins <-   c("CXCL8", "CCL20", "IL17F", "IL17C", "IL17RA", "IL17A", "TRAF2", "CASP8", "IL1B", "TNF", "IL6",
+                "MMP9", "LCN2", "CXCL8", "CCL20", "CCL7", "CCL2", "CSF3", "DEFA1_DEFA1B", "DEFB4A_DEFB4B")
+ cancer_data_long |>
+  filter(Assay %in% proteins, 
+         Disease %in% c("PAN", "CAD healthy")) |>
+  mutate(Disease = recode(Disease, 
+                          PAN = "Pancreatic cancer",
+                          `CAD healthy` = "Healthy")) |> 
+  select(Sample = DAid, Assay, NPX, Disease) |>
+  mutate(Disease = factor(Disease, levels = names(pal_group))) |> 
+  ggplot(aes(Disease,NPX, color = Disease, fill = Disease)) +
+  geom_quasirandom(alpha = 0.8) +
+  geom_boxplot(alpha = 0.2, color = "black", outlier.colour = NA) +
+  facet_wrap(~Assay, scales = "free_y", nrow = 2) +
+  theme_hpa(angled = T) +
+  scale_color_manual(values = c(pal_group, pal_ukb)) +
+  scale_fill_manual(values = c(pal_group, pal_ukb)) +
+  xlab("") +
+  ylab("")
+ 
+ggsave(savepath("il17_examples.pdf"), h = 6, w = 15)
+```
+
+
+## GO BP
+
+```{r}
+gse <- gseGO(geneList = gene_list, 
+             ont = "BP", 
+             keyType = "UNIPROT", 
+             #  nPerm = 10000, 
+             #  minGSSize = 3, 
+             #  maxGSSize = 800, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = "org.Hs.eg.db", 
+             pAdjustMethod = "BH")
+
+# Dotplot
+dotplot(gse, showCategory=50, split=".sign") + facet_grid(.~.sign) + theme_hpa()
+
+# Pathway network
+gse_translated <- setReadable(gse, 'org.Hs.eg.db', 'UNIPROT')
+cnetplot(gse_translated, categorySize="pvalue", foldChange=gene_list, showCategory = 5)
+
+ggsave(savepath("GO_BP_top5.png"), h = 10, w = 10)
+```
+
+
+# Citations
+
+```{r}
+packageVersion("limma")
+packageVersion("clusterProfiler")
+
+```
+
