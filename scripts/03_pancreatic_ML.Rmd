@@ -1,0 +1,1162 @@
+---
+title: "03_machine_learning"
+output: html_document
+date: "2024-10-31"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Set up
+
+```{r}
+library(HDAnalyzeR)
+
+source("scripts/functions/functions_analyses.R")
+source("scripts/functions/functions_utility.R")
+source("scripts/functions/functions_visualization.R")
+source("scripts/functions/themes_palettes.R")
+
+
+# Read in data (pan-disease)
+data_disease <- import_df("../Human-disease-blood-atlas/data/final_data/HPA/v24_2/disease_data_phase1.tsv")
+meta_disease <- import_df("../Human-disease-blood-atlas/data/final_data/HPA/v24_2/disease_meta_phase1.tsv")
+
+# Pancreatic cancer metadata
+pancreatic_meta <- readxl::read_excel("data/clinical_metadata/Pancreatic/UPApatients.xlsx")
+```
+
+### Subsample DA data
+
+```{r Subsample other cancers}
+# Minimum is myeloma - 41 -> 40 from each disease
+cancer_metadata |> 
+  filter(!Disease %in% c("PAN", "CAD healthy")) |> 
+  group_by(Disease) |> 
+  summarise(n = n_distinct(DAid)) |> 
+  arrange(n)
+
+set.seed(213)
+sampled_other_cancers <- 
+  cancer_metadata |> 
+  filter(!Disease %in% c("PAN", "CAD healthy")) |> 
+  group_by(Disease) |> 
+  sample_n(40)
+
+final_meta <- 
+  sampled_other_cancers |> 
+  bind_rows(cancer_metadata |> 
+              filter(Disease %in% c("PAN", "CAD healthy"))) |> 
+  mutate(Disease = case_when(Disease == "PAN" ~ "Pancreatic cancer",
+                             Disease == "CAD healthy" ~ "Healthy",
+                             T ~ "Other cancers")) 
+```
+
+
+# Data splitting
+
+```{r}
+ml_meta <-
+  final_meta |> 
+  filter(Disease %in% c("Pancreatic cancer", "Healthy"))
+
+current_wide_data <- 
+  cancer_data_long |>
+  filter(Disease %in% c("PAN", "CAD healthy")) |> 
+  mutate(Disease = recode(Disease, 
+                          `CAD healthy` = "Healthy",
+                          PAN = "Pancreatic cancer")) |> 
+  select(DAid, Disease, Assay, NPX) |> 
+  pivot_wider(names_from = "Assay", values_from = "NPX") 
+
+set.seed(213)
+cancer_split <-
+  current_wide_data |> 
+  initial_split(prop = 0.7, strata = Disease)
+
+cancer_train <- training(cancer_split)
+cancer_test <- testing(cancer_split)
+
+saveRDS(cancer_train, "data/processed/ML/cancer_train.rds")
+saveRDS(cancer_test, "data/processed/ML/cancer_test.rds")
+
+```
+
+## Define general recipe
+
+```{r}
+cancer_recipe <- 
+  recipe(Disease ~ ., data = cancer_train) |> 
+  update_role(DAid, new_role = "id") |> 
+  step_normalize(all_numeric()) |> 
+  step_nzv(all_numeric()) |> 
+  step_corr(all_numeric()) |> 
+  step_select_roc(all_numeric(), outcome = "Disease", threshold = 0.7) |>  
+  step_impute_knn(all_numeric()) |> 
+  step_downsample(Disease)
+```
+
+### Check variables retained
+
+```{r}
+# ###
+# train_preped <- prep(standardized) %>%
+#   bake(new_data = NULL)
+# 
+# test_preped <-  prep(standardized) %>%
+#   bake(new_data = test_data)
+# 
+# ?control_stack_grid()
+# 
+# library(vip)
+# Check retained variables
+#dat <- prep(cancer_recipe, cancer_train)
+#dat$template |> dim()
+#training_bake <- bake(cancer_recipe)
+```
+
+## Resamples
+
+```{r}
+# Generate resamples
+set.seed(213)
+cancer_rs <- vfold_cv(cancer_train, v = 10, strata = Disease)
+
+# Define evaluation metrics for all workflows
+eval_metrics <- metric_set(roc_auc, accuracy, sensitivity, specificity)
+
+# Define control grid
+#set.seed(213)
+ctrl <- control_grid(save_pred = TRUE, 
+                     parallel_over = "everything") 
+ctrl <- control_grid(verbose = TRUE, 
+                     allow_par = TRUE,
+                     save_pred = TRUE, 
+                     parallel_over = "everything") 
+```
+
+## Try random
+
+
+```{r}
+cancer_recipe_random <- 
+  recipe(Disease ~ ., data = cancer_train) |> 
+  update_role(DAid, new_role = "id") |> 
+  step_normalize(all_numeric()) |> 
+  step_nzv(all_numeric()) |> 
+  step_corr(all_numeric()) |> 
+  step_select_roc(all_numeric(), outcome = "Disease", threshold = 0.7) |>  
+  step_impute_knn(all_numeric()) |> 
+  step_shuffle(all_numeric()) |> 
+  step_downsample(Disease)
+
+glmnet_lasso_specs <-
+  logistic_reg() |>
+  set_mode("classification") |>
+  set_engine("glmnet") |>
+  set_args(penalty = tune(),
+           mixture = 1) 
+
+glmnet_wflow_random <-
+  workflow() |> 
+  add_recipe(cancer_recipe_random) |> 
+  add_model(glmnet_lasso_specs) 
+
+glmnet_wflow<-
+  workflow() |> 
+  add_recipe(cancer_recipe) |> 
+  add_model(glmnet_lasso_specs) 
+
+set.seed(213)
+glmnet_grid <-
+  glmnet_wflow_random |>
+  extract_parameter_set_dials() |>
+  grid_latin_hypercube(size = 5)
+
+set.seed(213)
+cancer_rs <- vfold_cv(cancer_train, v = 10, strata = Disease)
+
+eval_metrics <- metric_set(roc_auc, accuracy, sensitivity, specificity)
+
+set.seed(213)
+ctrl <- control_grid(save_pred = TRUE, 
+                     parallel_over = "everything"#, 
+                     #extract = get_coefs
+                     ) # look at extract = identity
+
+
+set.seed(213)
+glmnet_res_da_random <-
+  glmnet_wflow_random |>
+  tune_grid(
+    resamples = cancer_rs,
+    grid = glmnet_grid,
+    control = ctrl,
+    metrics = eval_metrics)
+
+glmnet_res_da_random |> autoplot()
+
+set.seed(213)
+glmnet_res_da <-
+  glmnet_wflow |>
+  tune_grid(
+    resamples = cancer_rs,
+    grid = glmnet_grid,
+    control = ctrl,
+    metrics = eval_metrics)
+
+
+glmnet_res_da |> autoplot()
+
+best_lasso <- 
+  glmnet_res_da |> 
+  select_best("roc_auc")
+
+final_glmnet_wf <- 
+  glmnet_wflow |> 
+  finalize_workflow(best_lasso)
+
+
+final_lasso <- 
+  fit(final_glmnet_wf, cancer_train)
+
+final_lasso |> 
+  extract_fit_parsnip() |> 
+  tidy() |> 
+  filter(abs(estimate)>0,
+         term!= "(Intercept)") |> 
+  arrange(-abs(estimate))
+
+autoplot(glmnet_res_da)
+```
+
+
+# lasso
+
+## Define specifications
+
+```{r}
+glmnet_lasso_specs <-
+  logistic_reg() |>
+  set_mode("classification") |>
+  set_engine("glmnet") |>
+  set_args(penalty = tune(),
+           mixture = 1) 
+
+# Set up lasso workflow
+glmnet_wflow <-
+  workflow() |> 
+  add_recipe(cancer_recipe) |> 
+  add_model(glmnet_lasso_specs) 
+```
+
+## Hyperparameter optimization
+
+```{r}
+# Define hyperparameter tuning grid
+set.seed(213)
+glmnet_grid <-
+  glmnet_wflow |>
+  extract_parameter_set_dials() |>
+  grid_latin_hypercube(size = 30)
+
+# Hyperparameter tuning
+set.seed(213)
+glmnet_res_da <-
+  glmnet_wflow |>
+  tune_grid(
+    resamples = cancer_rs,
+    grid = glmnet_grid,
+    control = ctrl,
+    metrics = eval_metrics)
+
+# saveRDS(glmnet_res_da, "data/processed/ML_res/lasso_20230925.rds")
+# glmnet_res_da <- readRDS("data/processed/ML_res/lasso_20230925.rds")
+
+# Explore results and select the best performing hyperparameter combination
+autoplot(glmnet_res_da)
+
+best_glmnet <- 
+  glmnet_res_da |> 
+  select_best("roc_auc")
+```
+
+## Final fit
+
+```{r}
+final_glmnet <- 
+  glmnet_wflow |> 
+  finalize_workflow(best_glmnet)
+
+final_glmnet_fit <- 
+  last_fit(final_glmnet, cancer_split)
+```
+
+## Exploration
+
+
+```{r}
+# Explore performance
+final_glmnet_fit |> 
+  collect_metrics() 
+
+final_glmnet_fit |> 
+  collect_predictions() |> 
+  mutate(Disease = factor(Disease, levels = c("Pancreatic cancer", "Healthy"))) |> 
+  roc_auc(Disease, `.pred_Pancreatic cancer`) 
+
+# Explore important proteins
+important_proteins_da <- 
+  final_glmnet_fit  |> 
+  extract_fit_parsnip() %>%
+  tidy() |> 
+  filter(term != "(Intercept)") |> 
+  arrange(-abs(estimate)) |> 
+  filter(abs(estimate) > 0)
+
+#saveRDS(important_proteins_da, "data/processed/pancreatic/da_lasso_importance.rds")
+
+# Visualize important proteins
+important_proteins_da |> 
+  mutate(sign = ifelse(estimate > 0, "positive", "negative")) |> 
+  ggplot(aes(abs(estimate), fct_reorder(term, abs(estimate)), fill = sign)) +
+  geom_col(alpha  = 0.8) +
+  theme_hpa() +
+  scale_fill_manual(values = c("#FE625E", "#75B2E9")) +
+  xlab("Model estimate") +
+  ylab("") +
+  ggtitle("lasso features")
+
+# Figure 3 C
+#ggsave(savepath("lasso_top_deatures.pdf"), h = 5, w = 5)
+
+# ROC cruve
+
+```
+
+
+
+# random forest
+
+## Define specifications
+
+```{r}
+cores <- parallel::detectCores()
+
+rf_specs <-
+  rand_forest() |>
+  set_mode("classification") |>
+  set_engine("ranger", importance = "impurity", num.threads = cores) |>
+  set_args(mtry = tune(), min_n = tune(), trees = 1000) 
+
+# Set up random forest workflow
+rf_wflow <-
+  workflow() |> 
+  add_recipe(cancer_recipe) |> 
+  add_model(rf_specs) 
+```
+
+
+## Hyperparameter optimization
+
+```{r}
+# Define hyperparameter tuning grid
+set.seed(213) #test
+rf_grid <-
+  rf_wflow |>
+  extract_parameter_set_dials() |>
+  update(mtry = mtry(c(0, 40))) |>
+  grid_latin_hypercube(size = 15)
+
+# Hyperparameter tuning
+set.seed(213)
+rf_res_da <-
+  rf_wflow |>
+  tune_grid(
+    resamples = cancer_rs,
+    grid = rf_grid,
+    control = ctrl,
+    metrics = eval_metrics)
+
+saveRDS(rf_res_da, "data/processed/ML_res/rf_20231006.rds")
+#rf_res_da <- readRDS("data/processed/ML_res/rf_20231005.rds")
+
+# Explore results and select the best performing hyperparameter combination
+autoplot(rf_res_da)
+
+best_rf <- 
+  select_best(rf_res_da, metric = "roc_auc") |> 
+  select(-.config)
+```
+
+## Final fit
+
+```{r}
+rf_wflow <- 
+  rf_wflow |>  
+  finalize_workflow(best_rf)
+
+final_rf_fit <- last_fit(rf_wflow, cancer_split, metrics = eval_metrics) 
+```
+
+## Exploration
+
+```{r}
+# Explore performance
+final_rf_fit |> 
+  collect_metrics() 
+
+final_rf_fit |> 
+  collect_predictions() |> 
+  mutate(Disease = factor(Disease, levels = c("Pancreatic cancer", "Healthy"))) |> 
+  roc_auc(Disease, `.pred_Pancreatic cancer`) 
+
+# Explore important proteins
+important_proteins_rf <- 
+  final_rf_fit  |> 
+  extract_fit_parsnip() |> 
+  vip::vi() |> 
+  arrange(-Importance) |> 
+  filter(Importance > 0)
+
+#saveRDS(important_proteins_rf, "data/processed/pancreatic/da_rf_importance.rds")
+
+# Visualize important proteins
+important_proteins_rf |> 
+  arrange(-Importance) |> 
+  head(24) |> 
+  ggplot(aes(Importance, fct_reorder(Variable, Importance))) +
+  geom_col(alpha  = 0.8) +
+  theme_hpa() +
+  xlab("Importance") +
+  ylab("") +
+  ggtitle("random forest features")
+
+important_proteins_rf |> 
+  arrange(-Importance) |> 
+  head(25) |> 
+  filter(Variable %in% important_proteins_da$term)
+# Figure 3C
+ggsave(savepath("rf_top_deatures.pdf"), h = 5, w = 4)
+
+# ROC cruve
+
+```
+
+
+
+
+# Comparison lasso / rf
+
+## Overlap
+
+```{r}
+top_overlapping_prots <- 
+  important_proteins_rf |> 
+  head(24) |> 
+  filter(Variable %in% important_proteins_da$term)
+
+proteins_rf <- important_proteins_rf$Variable
+proteins_lasso <- important_proteins_da$term
+
+y <- list("RF" = proteins_rf, 
+          "lasso" = proteins_lasso)
+plot(euler(y, shape = "ellipse"), quantities = TRUE, fills = c("#D6E9C3", "#D5CDE1")) |> as.ggplot()
+
+# Figure 3B
+ggsave(savepath("overlap_ML.pdf"), h = 3, w = 3)
+
+## Plot overlapping proteins 
+cancer_data_long |>
+  filter(Assay %in% top_overlapping_prots$Variable, 
+         Disease %in% c("PAN", "CAD healthy")) |>
+  mutate(Disease = recode(Disease, 
+                          PAN = "Pancreatic cancer",
+                          `CAD healthy` = "Healthy"),
+         Type = ifelse(Assay %in% c("CSF1", "LTA4H", "PTN"), "Up", "Down")) |> 
+  select(Sample = DAid, Type, Assay, NPX, Disease) |>
+  mutate(Disease = factor(Disease, levels = names(pal_group)),
+         Type = factor(Type, levels = c("Up", "Down"))) |> 
+  ggplot(aes(Disease,NPX, color = Disease, fill = Disease)) +
+  geom_quasirandom(alpha = 0.8) +
+  geom_boxplot(alpha = 0.2, color = "black", outlier.colour = NA) +
+  facet_wrap(Type~Assay, scales = "free_y", nrow = 1) +
+  theme_hpa(angled = T) +
+  scale_color_manual(values = c(pal_group)) +
+  scale_fill_manual(values = c(pal_group)) +
+  xlab("") +
+  ylab("")
+
+# Figure 3D
+ggsave(savepath("examples_ml_2.pdf"), h = 3, w = 14)
+#ggsave(savepath("examples_ml.pdf"), h = 6.5, w = 8)
+
+
+
+cancer_data_long |>
+  filter(Assay %in% top_overlapping_prots$Variable, 
+         Disease %in% c("PAN", "CAD healthy")) |>
+  mutate(Disease = recode(Disease, 
+                          PAN = "Pancreatic cancer",
+                          `CAD healthy` = "Healthy"),
+         Type = ifelse(Assay %in% c("CSF1", "LTA4H", "PTN"), "Up", "Down")) |> 
+  select(Sample = DAid, Type, Assay, NPX, Disease) |>
+  mutate(Disease = factor(Disease, levels = names(pal_group)),
+         Type = factor(Type, levels = c("Up", "Down"))) |> 
+  ggplot(aes(Disease,NPX, color = Disease, fill = Disease)) +
+  geom_quasirandom(alpha = 0.8) +
+  geom_boxplot(alpha = 0.2, color = "black", outlier.colour = NA) +
+  facet_wrap(Type~Assay, scales = "free_x", nrow = 1) +
+  theme_hpa(angled = T) +
+  coord_flip() +
+  scale_color_manual(values = c(pal_group)) +
+  scale_fill_manual(values = c(pal_group)) +
+  xlab("") +
+  ylab("")
+
+# Figure 3D
+ggsave(savepath("examples_ml.pdf"), h = 4, w = 12)
+```
+
+## Correlation
+
+```{r}
+corr_mat <- 
+  cancer_data_wide |> 
+  filter(Disease %in% c("PAN", "CAD healthy")) |> 
+  select(all_of(overlapping_prots)) |> 
+  cor(use = "complete.obs")
+
+corrplot(corr_mat, 
+         method = "square",
+         addCoef.col = 'black',
+         type = "lower", 
+         order = "hclust", 
+         hclust.method = "ward.D2",
+         col = pal_corr,  
+         tl.col = "black", 
+         tl.srt = 0)
+
+# Supplementary figure 5A
+#ggsave(savepath("all_corr_ml.pdf"), h = 10, w = 10)
+
+corr_mat_selected <- 
+  cancer_data_wide |> 
+  filter(Disease %in% c("PAN", "CAD healthy")) |> 
+  select(all_of(top_overlapping_prots$Variable)) |> 
+  cor(use = "complete.obs")
+
+corrplot(corr_mat_selected, 
+         method = "square",
+         addCoef.col = 'black',
+         type = "lower", 
+         order = "hclust", 
+         hclust.method = "ward.D2",
+         col = pal_corr,  
+         tl.col = "black", 
+         tl.srt = 0)
+
+# Figure 3D
+ggsave(savepath("selected_corr_ml.pdf"), h = 10, w = 10)
+```
+
+## Importances
+
+```{r}
+overlapping_prots <- intersect(proteins_lasso, proteins_rf)
+
+important_proteins_rf |> 
+  select(Variable, Importance_rf = Importance) |> 
+  left_join(important_proteins_da |> 
+              mutate(Importance_lasso = abs(estimate)) |> 
+              select(Variable = term, Importance_lasso), by = "Variable") |> 
+  mutate(Importance_lasso = ifelse(is.na(Importance_lasso), 0, Importance_lasso),
+         Importance_rf = ifelse(is.na(Importance_rf), 0, Importance_rf)) |> 
+  mutate(Type = ifelse(Variable %in% overlapping_prots, "Overlapping", "Not overlapping")) |> 
+  ggplot(aes(Importance_rf, Importance_lasso, color = Type)) +
+  geom_point() +
+  geom_text_repel(aes(label = Variable), show.legend = F) +
+  scale_color_manual(values = c("grey70", "#A41E60")) +
+  theme_hpa()
+
+# Figure 3B
+#ggsave(savepath("comparison_importances.pdf"), h = 6, w = 6)
+
+
+
+important_proteins_rf |> 
+  select(Variable, Importance_rf = Importance) |> 
+  left_join(important_proteins_da |> 
+              mutate(Importance_lasso = abs(estimate)) |> 
+              select(Variable = term, Importance_lasso), by = "Variable") |> 
+  mutate(Importance_lasso = ifelse(is.na(Importance_lasso), 0, Importance_lasso),
+         Importance_rf = ifelse(is.na(Importance_rf), 0, Importance_rf)) |> 
+  mutate(Type = ifelse(Variable %in% overlapping_prots, "Overlapping", "Not overlapping")) |> 
+  mutate(Importance_rf = scales::rescale(Importance_rf, c(0,100)),
+         Importance_lasso = scales::rescale(Importance_lasso, c(0,100))) |> 
+  saveRDS("data/processed/ML_res/importances_combined.rds")
+
+
+```
+
+
+## Probabilities
+
+```{r}
+
+final_rf_fit |> 
+  collect_predictions() |> 
+  select(pancreatic_probability = `.pred_Pancreatic cancer`, Disease) |> 
+  mutate(DAid = cancer_test$DAid,
+         Model = "random forest") |> 
+  bind_rows(final_glmnet_fit |> 
+              collect_predictions() |> 
+              select(pancreatic_probability = `.pred_Pancreatic cancer`, Disease) |> 
+              mutate(DAid = cancer_test$DAid,
+                     Model = "lasso")) |> 
+  ggplot(aes(Model, pancreatic_probability, color = Model)) +
+  geom_line(aes(group = DAid), color = "grey80", alpha = 0.3) +
+  geom_quasirandom() +
+ # geom_violin(fill = NA, color = "grey20", outlier.colour = NA) +
+#  geom_boxplot(fill = NA, color = "grey20", outlier.colour = NA) +
+  facet_wrap(~Disease) +
+  scale_color_manual(values = c("#BBDB9B", "#A594BD")) +
+  theme_hpa(angled = T)
+
+ggsave(savepath("probabilties.pdf"), h = 5, w = 5)
+
+```
+
+# Signature against other cancers
+
+### General
+
+```{r}
+all_wide_data <- 
+  cancer_data_long |>
+  select(DAid, Disease, Assay, NPX) |> 
+  pivot_wider(names_from = "Assay", values_from = "NPX")
+
+```
+
+## glmnet
+
+```{r}
+
+pancreatic_against_cancers <-  
+  function(cancer) {
+    
+    # Prepare data
+    cancer_split_current <- 
+      all_wide_data |>
+      select(DAid, Disease, important_proteins_da$term) |> 
+      filter(Disease == cancer) |> 
+      initial_split(prop = 0.7, strata = Disease)
+    
+    training_dat <- 
+      cancer_train |> 
+      mutate(DAid = as.character(DAid)) |> 
+      select(DAid, Disease, important_proteins_da$term) |> 
+      filter(Disease == "Pancreatic cancer") |> 
+      bind_rows(training(cancer_split_current))
+    
+    testing_dat <- 
+      cancer_test |> 
+      mutate(DAid = as.character(DAid)) |> 
+      select(DAid, Disease, important_proteins_da$term) |> 
+      filter(Disease == "Pancreatic cancer") |> 
+      bind_rows(testing(cancer_split_current))
+    
+    cancer_split_custom <- make_splits(training_dat, testing_dat)
+    
+    cancer_recipe_2 <- 
+      recipe(Disease ~ ., data = training_dat) |> 
+      update_role(DAid, new_role = "id") |> 
+      step_normalize(all_numeric()) |> 
+      step_nzv(all_numeric()) |> 
+      step_impute_knn(all_numeric()) #|> 
+    #step_downsample(Disease)
+    
+    glmnet_specs_2 <- 
+      logistic_reg() |> 
+      set_mode("classification") |> 
+      set_engine("glmnet") |> 
+      set_args(penalty = tune(), 
+               mixture = 1) 
+    
+    glmnet_wflow_2 <-
+      workflow() |> 
+      add_recipe(cancer_recipe_2) |> 
+      add_model(glmnet_specs_2) 
+    
+    # Define glmnet grid
+    set.seed(213)
+    glmnet_grid_2 <-
+      glmnet_wflow_2 |>
+      extract_parameter_set_dials() |>
+      grid_latin_hypercube(size = 30)
+    
+    # Define the resamples (CV)
+    set.seed(213)
+    cancer_rs_2 <- vfold_cv(training_dat, v = 10, strata = Disease)
+    
+    # Define the evaluation metrics (add brier)
+    eval_metrics <- metric_set(roc_auc, accuracy, sensitivity, specificity)
+    
+    # Define control_grid
+    set.seed(213)
+    ctrl <- control_grid(save_pred = TRUE, parallel_over = "everything") # look at extract = identity
+    
+    # Glmnet grid search
+    set.seed(213)
+    glmnet_res_2 <-
+      glmnet_wflow_2 |>
+      tune_grid(
+        resamples = cancer_rs_2,
+        grid = glmnet_grid_2,
+        control = ctrl,
+        metrics = eval_metrics
+      )
+    
+    autoplot(glmnet_res_2)
+    
+    best_glmnet_2 <- 
+      select_best(glmnet_res_2, metric = "roc_auc") |> 
+      select(-.config)
+    
+    glmnet_wflow_2 <- 
+      glmnet_wflow_2 |>  
+      finalize_workflow(best_glmnet_2)
+    
+    final_glmnet_fit_2 <- last_fit(glmnet_wflow_2, cancer_split_custom, metrics = eval_metrics) 
+    
+    performance <- 
+      final_glmnet_fit_2 |> 
+      collect_metrics() |> 
+      select(-.config, -.estimator)
+    
+    glmnet_auc <- 
+      final_glmnet_fit_2 |> 
+      collect_metrics() |> 
+      filter(.metric == "roc_auc") |> 
+      pull(.estimate) |> 
+      round(2)
+    
+    important_proteins_2 <- 
+      final_glmnet_fit_2  |> 
+      extract_fit_parsnip() %>%
+      tidy() |> 
+      filter(term != "(Intercept)") |> 
+      arrange(-abs(estimate)) |> 
+      filter(abs(estimate) > 0)
+    
+    predictions <- 
+      final_glmnet_fit_2 |> 
+      collect_predictions()
+    
+    cm <- 
+      predictions |> 
+      conf_mat(Disease, .pred_class) 
+    
+    roc <- 
+      predictions |> 
+      mutate(Disease = factor(Disease, levels = c("Pancreatic cancer",  cancer))) |> 
+      roc_curve(truth = Disease, `.pred_Pancreatic cancer`) 
+    
+    
+    return(list("penalty" = best_glmnet_2,
+                "performance" = performance,
+                "predictions" = predictions,
+                "roc" = roc,
+                "cm" = cm,
+                "important_proteins" = important_proteins_2))
+  }
+
+
+# Run for all cancers
+all_cancer_results <- 
+  map(all_cancers_levels[-14], ~pancreatic_against_cancers(.)) |> 
+  set_names(all_cancers_levels[-14])
+```
+
+### Importance scores
+
+```{r}
+# Extract importance inforamtion
+imp_prots <- 
+  map_df(all_cancers_levels[-14], function(cancer){
+  
+  res <- all_cancer_results[[cancer]]
+  res$important_proteins |> 
+    mutate(Cancer = cancer)
+})
+ 
+# imp_prots |> 
+#   group_by(term) |> 
+#   summarise(n = n_distinct(Cancer)) |> 
+#   arrange(-n) |> 
+#   filter(n > 1)
+  
+# Visualize
+annotation_row <- 
+  tibble(row = names(pal_cancer_controls),
+         Cancer = names(pal_cancer_controls)) |> 
+  column_to_rownames("row")
+
+annotation_col <- 
+  important_proteins_da |> 
+  select(-penalty) |> 
+  mutate(estimate = abs(estimate)) |> 
+  rename(Estimate_original = estimate) |> 
+  column_to_rownames("term")
+
+
+imp_prots |> 
+  left_join(cancers_mapping |> 
+              select(-Cancer), by = c("Cancer" = "Cancer_code")) |> 
+  mutate(Cancer_short = factor(Cancer_short, levels = cancers_mapping$Cancer_short)) |> 
+  select(term, estimate, Cancer = Cancer_short) |> 
+  mutate(estimate = abs(estimate)) |> 
+  spread(Cancer, estimate, fill = 0) |> 
+  column_to_rownames("term") |> 
+  t() |> 
+  pheatmap(color = colorRampPalette(c("white", "darkred"))(100),
+            annotation_row = annotation_row,
+           annotation_col = annotation_col,
+           annotation_colors = list("Cancer" = pal_cancer_controls),
+           cellwidth = 5, cellheight = 5, fontsize = 5) |> as.ggplot()
+
+# Figure 3G
+ggsave(savepath("important_lasso_proteins_all_cancers.pdf"), h = 10, w = 5)
+```
+
+### ROC curves
+
+```{r}
+# Extract ROC curve information
+all_roc <- 
+  map_df(all_cancers_levels[-14], function(cancer){
+  
+  res <- all_cancer_results[[cancer]]
+  auc <- 
+    res$performance |> 
+    filter(.metric == "roc_auc") |> 
+    pull(.estimate)
+  res$roc |> 
+    mutate(Cancer = cancer,
+           AUC = auc)
+})
+
+# Visualize results
+pal_cancer_controls <- 
+  cancers_mapping |> 
+  filter(Cancer_code != "PAN") |> 
+  group_by_all() |> 
+  mutate(color = pal_all_cancers[[Cancer_code]]) |> 
+  ungroup() |> 
+  select(-Cancer_code, -Cancer) |> 
+  deframe()
+
+aucs <- 
+  cancers_mapping |> 
+  filter(Cancer_code != "PAN") |> 
+  mutate(Cancer_short = factor(Cancer_short, levels = cancers_mapping$Cancer_short)) |> 
+  left_join(all_roc |> 
+              distinct(Cancer, AUC), by = c("Cancer_code" = "Cancer")) |> 
+    select(-Cancer_code,-Cancer) |> 
+  mutate(y = c(0.65, 0.60, 0.55, 0.50, 
+               0.45, 0.40, 0.35, 0.30,
+               0.25, 0.20, 0.15, 0.10, 0.05),
+         x = rep(0.75, 13))
+
+all_roc |> 
+  left_join(cancers_mapping, by = c("Cancer" = "Cancer_code")) |> 
+  mutate(Cancer_short = factor(Cancer_short, levels = cancers_mapping$Cancer_short)) |> 
+  ggplot(aes(x = 1-specificity, y=sensitivity, group = Cancer_short, color = Cancer_short)) +
+  geom_path(linewidth = 0.7, show.legend = F) +
+  geom_segment(aes(x = 0, y = 0, xend = 1,  yend = 1), 
+               colour='grey', linetype = 'dotdash', linewidth = 0.3) +
+  geom_text(aes(x = 0.85, y = 0.70, label = "AUC"), fontface = "bold", color = "black", inherit.aes = F, size = 3) +
+  geom_text(data = aucs, aes(x, y, label = Cancer_short), size = 3, show.legend = F, hjust = 1, fontface = "bold") +
+  geom_text(data = aucs, aes(x + 0.10 , y, label = round(AUC,3)), size = 3, show.legend = F, color = "black") +
+  theme_hpa() + 
+  scale_color_manual(values = pal_cancer_controls) +
+  coord_equal() +
+  ggtitle("lasso")
+
+# Figure 3F
+#ggsave(savepath("lasso_other_cancers.pdf"), h = 5, w = 5)
+```
+
+### Probabilities
+
+```{r}
+
+```
+
+
+## rf
+```{r}
+
+pancreatic_against_cancers_rf <-  
+  function(cancer) {
+    
+    # Prepare data
+    cancer_split_current <- 
+      all_wide_data |>
+      select(DAid, Disease, important_proteins_rf$Variable) |> 
+      filter(Disease == cancer) |> 
+      initial_split(prop = 0.7, strata = Disease)
+    
+    training_dat <- 
+      cancer_train |> 
+      mutate(DAid = as.character(DAid)) |> 
+      select(DAid, Disease, important_proteins_rf$Variable) |> 
+      filter(Disease == "Pancreatic cancer") |> 
+      bind_rows(training(cancer_split_current))
+    
+    testing_dat <- 
+      cancer_test |> 
+      mutate(DAid = as.character(DAid)) |> 
+      select(DAid, Disease, important_proteins_rf$Variable) |> 
+      filter(Disease == "Pancreatic cancer") |> 
+      bind_rows(testing(cancer_split_current))
+    
+    cancer_split_custom <- make_splits(training_dat, testing_dat)
+    
+    cancer_recipe_2 <- 
+      recipe(Disease ~ ., data = training_dat) |> 
+      update_role(DAid, new_role = "id") |> 
+      step_normalize(all_numeric()) |> 
+      step_nzv(all_numeric()) |> 
+      step_impute_knn(all_numeric()) #|> 
+    #step_downsample(Disease)
+    
+    cores <- parallel::detectCores()
+    
+    rf_specs_2 <-
+      rand_forest() |>
+      set_mode("classification") |>
+      set_engine("ranger", importance = "impurity", num.threads = cores) |>
+      set_args(mtry = tune(), min_n = tune(), trees = 1000) 
+    
+    # Set up random forest workflow
+    rf_wflow_2 <-
+      workflow() |> 
+      add_recipe(cancer_recipe_2) |> 
+      add_model(rf_specs_2) 
+    
+    # Define hyperparameter tuning grid
+    set.seed(213) #test
+    rf_grid_2 <-
+      rf_wflow_2 |>
+      extract_parameter_set_dials() |>
+      update(mtry = mtry(c(0, 40))) |>
+      grid_latin_hypercube(size = 15)
+    
+    # Define the resamples (CV)
+    set.seed(213)
+    cancer_rs_2 <- vfold_cv(training_dat, v = 10, strata = Disease)
+    
+    # Define the evaluation metrics (add brier)
+    eval_metrics <- metric_set(roc_auc, accuracy, sensitivity, specificity)
+    
+    # Define control_grid
+    set.seed(213)
+    ctrl <- control_grid(save_pred = TRUE, parallel_over = "everything") # look at extract = identity
+    
+    # Hyperparameter tuning
+    set.seed(213)
+    rf_res_2 <-
+      rf_wflow_2 |>
+      tune_grid(
+        resamples = cancer_rs_2,
+        grid = rf_grid_2,
+        control = ctrl,
+        metrics = eval_metrics)
+    
+    best_rf_2 <- 
+      select_best(rf_res_2, metric = "roc_auc") |> 
+      select(-.config)
+    
+    rf_wflow_2 <- 
+      rf_wflow_2 |>  
+      finalize_workflow(best_rf_2)
+    
+    final_rf_fit_2 <- last_fit(rf_wflow_2, cancer_split_custom, metrics = eval_metrics) 
+    
+    performance <- 
+      final_rf_fit_2 |> 
+      collect_metrics() |> 
+      select(-.config, -.estimator)
+    
+    glmnet_auc <- 
+      final_rf_fit_2 |> 
+      collect_metrics() |> 
+      filter(.metric == "roc_auc") |> 
+      pull(.estimate) |> 
+      round(2)
+    
+    important_proteins_2 <- 
+      final_rf_fit_2  |> 
+      extract_fit_parsnip() |> 
+      vip::vi() |> 
+      arrange(-Importance) |> 
+      filter(Importance > 0)
+   
+    predictions <- 
+      final_rf_fit_2 |> 
+      collect_predictions()
+    
+    cm <- 
+      predictions |> 
+      conf_mat(Disease, .pred_class) 
+    
+    roc <- 
+      predictions |> 
+      mutate(Disease = factor(Disease, levels = c("Pancreatic cancer",  cancer))) |> 
+      roc_curve(truth = Disease, `.pred_Pancreatic cancer`) 
+    
+    
+    return(list("penalty" = best_rf_2,
+                "performance" = performance,
+                "predictions" = predictions,
+                "roc" = roc,
+                "cm" = cm,
+                "important_proteins" = important_proteins_2))
+  }
+
+
+# Run for all cancers
+all_cancer_results_rf <- 
+  map(all_cancers_levels[-14], ~pancreatic_against_cancers_rf(.)) |> 
+  set_names(all_cancers_levels[-14])
+```
+
+### Importance scores
+
+```{r}
+# Extract importance inforamtion
+imp_prots_rf <- 
+  map_df(all_cancers_levels[-14], function(cancer){
+  
+  res <- all_cancer_results_rf[[cancer]]
+  res$important_proteins |> 
+    mutate(Cancer = cancer)
+})
+ 
+# imp_prots |> 
+#   group_by(term) |> 
+#   summarise(n = n_distinct(Cancer)) |> 
+#   arrange(-n) |> 
+#   filter(n > 1)
+  
+# Visualize
+pal_cancer_controls
+
+annotation_row <- 
+  tibble(row = names(pal_cancer_controls),
+         Cancer = names(pal_cancer_controls)) |> 
+  column_to_rownames("row")
+
+annotation_col <- 
+  important_proteins_rf |> 
+  rename(Importance_original = Importance) |> 
+  column_to_rownames("Variable")
+
+selected <- 
+  imp_prots_rf |> 
+  group_by(Variable) |> 
+  summarize(imp = sum(Importance)) |> 
+  arrange(-imp) |> 
+  filter(imp > 3)
+
+imp_prots_rf |> 
+  filter(Variable %in% selected$Variable) |> 
+  left_join(cancers_mapping |> 
+              select(-Cancer), by = c("Cancer" = "Cancer_code")) |> 
+  mutate(Cancer_short = factor(Cancer_short, levels = cancers_mapping$Cancer_short)) |> 
+  select(-Cancer) |> 
+  rename(Cancer = Cancer_short) |> 
+  select(Variable, Importance, Cancer) |> 
+  spread(Cancer, Importance, fill = 0) |> 
+  column_to_rownames("Variable") |> 
+  t() |> 
+  pheatmap(color = colorRampPalette(c("white", "darkred"))(100),
+           annotation_row = annotation_row,
+           annotation_col = annotation_col,
+           annotation_colors = list("Cancer" = pal_cancer_controls),
+           cellwidth = 5, cellheight = 5, fontsize = 5) |> as.ggplot()
+
+# Figure 3G
+ggsave(savepath("important_rf_proteins_all_cancers.pdf"), h = 10, w = 20)
+
+```
+
+### ROC curves
+
+```{r}
+
+# Extract ROC curve information
+all_roc_rf <- 
+  map_df(all_cancers_levels[-14], function(cancer){
+  
+  res <- all_cancer_results_rf[[cancer]]
+  auc <- 
+    res$performance |> 
+    filter(.metric == "roc_auc") |> 
+    pull(.estimate)
+  res$roc |> 
+    mutate(Cancer = cancer,
+           AUC = auc)
+})
+
+# Visualize results
+pal_cancer_controls <- 
+  cancers_mapping |> 
+  filter(Cancer_code != "PAN") |> 
+  group_by_all() |> 
+  mutate(color = pal_all_cancers[[Cancer_code]]) |> 
+  ungroup() |> 
+  select(-Cancer_code, -Cancer) |> 
+  deframe()
+
+aucs_rf <- 
+  cancers_mapping |> 
+  filter(Cancer_code != "PAN") |> 
+  mutate(Cancer_short = factor(Cancer_short, levels = cancers_mapping$Cancer_short)) |> 
+  left_join(all_roc_rf |> 
+              distinct(Cancer, AUC), by = c("Cancer_code" = "Cancer")) |> 
+    select(-Cancer_code,-Cancer) |> 
+  mutate(y = c(0.65, 0.60, 0.55, 0.50, 
+               0.45, 0.40, 0.35, 0.30,
+               0.25, 0.20, 0.15, 0.10, 0.05),
+         x = rep(0.75, 13))
+
+all_roc_rf |> 
+  left_join(cancers_mapping, by = c("Cancer" = "Cancer_code")) |> 
+  mutate(Cancer_short = factor(Cancer_short, levels = cancers_mapping$Cancer_short)) |> 
+  ggplot(aes(x = 1-specificity, y=sensitivity, group = Cancer_short, color = Cancer_short)) +
+  geom_path(linewidth = 0.7, show.legend = F) +
+  geom_segment(aes(x = 0, y = 0, xend = 1,  yend = 1), 
+               colour='grey', linetype = 'dotdash', linewidth = 0.3) +
+  geom_text(aes(x = 0.85, y = 0.70, label = "AUC"), fontface = "bold", color = "black", inherit.aes = F, size = 3) +
+  geom_text(data = aucs_rf, aes(x, y, label = Cancer_short), size = 3, show.legend = F, hjust = 1, fontface = "bold") +
+  geom_text(data = aucs_rf, aes(x + 0.10 , y, label = round(AUC,3)), size = 3, show.legend = F, color = "black") +
+  theme_hpa() + 
+  scale_color_manual(values = pal_cancer_controls) +
+  coord_equal() 
+
+# Figure 3F
+ggsave(savepath("rf_other_cancers.pdf"), h = 5, w = 5)
+```
+
+# Citations
+
+```{r}
+packageVersion("tidymodels")
+packageVersion("themis")
+packageVersion("colino")
+packageVersion("vip")
+
+devtools::session_info()
+```

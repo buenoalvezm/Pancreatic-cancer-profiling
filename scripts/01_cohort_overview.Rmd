@@ -1,0 +1,229 @@
+---
+title: "01_cohort_overview"
+output: html_document
+date: "2024-10-31"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Set up
+
+```{r}
+library(HDAnalyzeR)
+
+source("scripts/functions/functions_analyses.R")
+source("scripts/functions/functions_utility.R")
+source("scripts/functions/functions_visualization.R")
+source("scripts/functions/themes_palettes.R")
+
+
+# Read in data (pan-disease)
+data_disease <- import_df("../Human-disease-blood-atlas/data/final_data/HPA/v24_2/disease_data_phase1.tsv")
+meta_disease <- import_df("../Human-disease-blood-atlas/data/final_data/HPA/v24_2/disease_meta_phase1.tsv")
+
+# Pancreatic cancer metadata
+pancreatic_meta <- readxl::read_excel("data/clinical_metadata/Pancreatic/UPApatients.xlsx")
+```
+
+
+## Prepare data
+
+```{r}
+# Phase 1
+dat_p1 <- hd_initialize(dat = data_disease,
+                        metadata = meta_disease)
+```
+
+## Prepare metadata
+
+```{r}
+meta_pancreatic <- 
+  meta_disease |> 
+  filter(Disease == "Pancreatic cancer") |> 
+  distinct(DAid, Vial_barcode = SampleID) |> 
+  left_join(pancreatic_meta |> 
+              mutate(Kodu = gsub("-", "", Kodu)), by = c("Vial_barcode" = "Kodu")) |> 
+  select(DAid, gender, T, N, M) |> 
+  rename(Stage = T) |> 
+  mutate(Stage = case_when(Stage == "1b" ~ "1B",
+                       Stage == "3b" ~ "3B",
+                       T ~ Stage),
+         M = case_when(M == "Mx" ~ "x",
+                       M == "X" ~ "x",
+                       M == "M1" ~ "1",
+                       T ~ M),
+         Stage_short = case_when(Stage %in% c("1", "1A", "1B", "1C") ~ "1",
+                                 Stage == "2" ~ "2",
+                                 Stage %in% c("3", "3A", "3B") ~ "3",
+                                 Stage == "4" ~ "4",
+                                 T ~ "Other"),
+         gender = as.character(gender))
+```
+
+# Gerneral QC
+
+```{r}
+qc_p1 <- hd_qc_summary(dat_p1,
+                       variable = "Disease")
+```
+
+# Barplot cohorts 
+
+```{r}
+current_levels <- c("Pancreatic cancer", "Healthy", "Streptococcal soft tissue infection", "Influenza", "Malaria")
+ucan_levels <- c("AML","CLL","LYMPH", "MYEL", "CRC", "LUNGC", "GLIOM", "BRC", "CVX", "ENDC", "OVC", "PRC")
+
+
+ucan_levels_ext <- cancers_mapping$Cancer_short[-13]
+
+data_qc |> 
+  filter(Disease %in% c("Pancreatic cancer", ucan_levels, "Hepatocellular cancer", current_levels[3:5], "CAD healthy")) |> 
+  distinct(DAid, Cohort, Disease) |> 
+  left_join(cancers_mapping, by = c("Disease" = "Cancer_code")) |> 
+  mutate(Disease = case_when(Cohort == "UCAN" ~ Cancer_short,
+                             Disease == "Hepatocellular cancer" ~ "Liver",
+                             Disease == "Pancreatic cancer" ~ "Pancreatic",
+                             Disease == "CAD healthy" ~ "Healthy",
+                             T ~ Disease)) |> 
+  mutate(Disease = factor(Disease, levels =  c("Pancreatic", ucan_levels_ext, current_levels[3:5], "Healthy")),
+         Class = case_when(Disease == "Pancreatic" ~ "Pancreatic cancer",
+                           Disease %in% ucan_levels_ext ~ "Other cancers",
+                           Disease %in% current_levels[3:5] ~ "Infectious diseases",
+                           Disease == "Healthy" ~ "Healthy")) |> 
+  group_by(Class, Disease) |> 
+  summarise(n = n_distinct(DAid)) |> 
+  arrange(Disease) |> 
+  ggplot(aes(Disease, n, fill = Class, color = Class)) +
+  geom_col(color = NA) +
+  geom_text(aes(label = n, y = n + 40), size = 3, fontface = "bold") +
+  scale_fill_manual(values = rev(c("#01395E","#FC7E6F","#DDC59D", "#8DC3AF"))) +
+  scale_color_manual(values = rev(c("#01395E","#FC7E6F","#DDC59D", "#8DC3AF"))) +
+  theme_hpa(angled = T) +
+  xlab("") +
+  ylab("Number of samples")
+
+ggsave(savepath("sample_overview.pdf"), h = 6, w = 8)
+
+data_qc |> 
+  filter(Disease %in% c("Pancreatic cancer", ucan_levels, "Hepatocellular cancer", current_levels[3:5], "CAD healthy")) |> 
+  distinct(DAid, Cohort, Disease) |> 
+  left_join(cancers_mapping, by = c("Disease" = "Cancer_code")) |> 
+  mutate(Disease = case_when(Cohort == "UCAN" ~ Cancer_short,
+                             Disease == "Hepatocellular cancer" ~ "Liver",
+                             Disease == "Pancreatic cancer" ~ "Pancreatic",
+                             Disease == "CAD healthy" ~ "Healthy",
+                             T ~ Disease)) |> 
+  mutate(Disease = factor(Disease, levels =  rev(c("Pancreatic", ucan_levels_ext, current_levels[3:5], "Healthy"))),
+         Class = case_when(Disease == "Pancreatic" ~ "Pancreatic cancer",
+                           Disease %in% ucan_levels_ext ~ "Other cancers",
+                           Disease %in% current_levels[3:5] ~ "Infectious diseases",
+                           Disease == "Healthy" ~ "Healthy")) |> 
+  group_by(Class, Disease) |> 
+  summarise(n = n_distinct(DAid)) |> 
+  arrange(Disease) |> 
+  ggplot(aes(Disease, n, fill = Class, color = Class)) +
+  geom_col(color = NA) +
+  geom_text(aes(label = n, y = n + 40), size = 3, fontface = "bold") +
+  scale_fill_manual(values = rev(c("#01395E","#FC7E6F","#DDC59D", "#8DC3AF"))) +
+  scale_color_manual(values = rev(c("#01395E","#FC7E6F","#DDC59D", "#8DC3AF"))) +
+  theme_hpa(angled = T) +
+  xlab("") +
+  ylab("Number of samples") +
+  coord_flip()
+
+ggsave(savepath("sample_overview.pdf"), h = 6, w = 10)
+
+
+cancer_metadata |> 
+  count(Disease) |> 
+  filter(Disease != "CAD healthy") |> 
+  left_join(cancers_mapping, by = c("Disease" = "Cancer_code")) |> 
+  mutate(Cancer = factor(Cancer, levels = cancers_mapping$Cancer)) |> 
+  arrange(Cancer) |> 
+  mutate(Cancer = str_to_lower(Cancer)) |> 
+  mutate(Text = paste0(Cancer, " (n = ", n, "), ")) |> 
+  pull(Text) |> 
+  glue::glue_collapse()
+
+cancer_metadata |> 
+  count(Disease) |> 
+  filter(!Disease %in% c("PAN", "HCC","CAD healthy")) |> 
+  left_join(cancers_mapping, by = c("Disease" = "Cancer_code")) |> 
+  mutate(Cancer = factor(Cancer, levels = cancers_mapping$Cancer)) |> 
+  arrange(Cancer) |> 
+  pull(n) |> sum()
+
+```
+
+
+# Age and sex distribution
+
+```{r}
+p_top <- 
+  final_meta |> 
+  filter(Age > 10) |> 
+  mutate(Disease = factor(Disease, levels = rev(levels_group))) |> 
+  ggplot(aes(y = Disease, x = Age, color = Disease, fill = Disease)) + 
+  geom_density_ridges(alpha = 0.9,
+                      scale = 0.9,
+                      #show.legend = F,
+                      size = 0.5,
+                      color = "black",
+                      quantile_lines=TRUE,
+                      quantile_fun=function(x,...)mean(x)) +
+  theme_hpa() +
+  theme(legend.position = "top") +
+  #scale_color_manual(values = pal_wellness) +
+  scale_fill_manual(values = pal_group) +
+  xlab("Age") +
+  ylab("")  
+
+p_bottom <- 
+  final_meta |> 
+  filter(!is.na(Sex)) |> 
+  mutate(Disease = factor(Disease, levels = rev(levels_group))) |> 
+  group_by(Disease, Sex) |> 
+  summarise(n = n_distinct(DAid))  |>  
+  arrange(Disease, desc(Sex)) |> 
+  mutate(cum_n = cumsum(n)) |> 
+  ungroup() |> 
+  arrange(Disease) |> 
+  ggplot(aes(Disease, n, fill = Sex, group = Sex)) +
+    geom_bar(stat = "identity", width = 0.4, alpha = 0.7,color = "black") +
+  coord_flip() +
+  theme_hpa() +
+  theme(axis.line.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_blank(),
+        legend.position = "top") +
+  ylab("Number of samples") 
+
+(p_top | p_bottom) +
+  plot_layout(guides = 'collect')
+
+ggsave(savepath("cohorts.pdf"),
+       height = 3,
+       width = 7)
+
+(p_top | p_bottom) 
+
+ggsave(savepath("cohorts_top.pdf"),
+       height = 3,
+       width = 10)
+```
+
+# PCA 
+
+# UMAP    
+
+
+
+# Citations
+
+```{r}
+packageVersion("")
+```
+
+
+
